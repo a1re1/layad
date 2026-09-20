@@ -1,0 +1,19 @@
+# Python environment and caches created by scripts/setup.sh
+.venv/
+__pycache__/
+*.pyc
+
+# Project-local model/cache/runtime state (LAYAD_HOME)
+.layad/
+
+# Rust build output
+/target/
+
+# Local daemon journals and logs
+logs/
+*.log
+
+# Harness state
+.drip/
+
+.DS_Store
