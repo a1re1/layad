@@ -49,6 +49,11 @@ case "$cmd" in
 esac
 STUB
 chmod +x "$STUB"
+# Exercise macOS service behavior on Linux CI without calling real launchd.
+mkdir -p "$TMP/bin"
+printf '#!/usr/bin/env bash\nprintf "Darwin\\n"\n' >"$TMP/bin/uname"
+chmod +x "$TMP/bin/uname"
+export PATH="$TMP/bin:$PATH"
 : >"$CALLS"
 
 FAKE_HOME="$TMP/home with spaces & ampersand"
@@ -161,12 +166,6 @@ if [[ -f "$FAKE_HOME/Library/LaunchAgents/dev.layad.test.plist" ]]; then
   fi
 else
   check "uninstall path is exercised in the stubbed worktree below" ok ok
-fi
-
-if grep -q "unload" "$CALLS"; then
-  check "stub launchctl was used" ok ok
-else
-  check "stub launchctl was used" bad ok
 fi
 
 # ------------------------------------------------ label and checkpoint safety
@@ -324,6 +323,12 @@ if grep -qx "dev.layad.test" "$LAYAD_TEST_STATE"; then
   check "a clean uninstall unloads the label" bad ok
 else
   check "a clean uninstall unloads the label" ok ok
+fi
+
+if grep -q "unload" "$CALLS"; then
+  check "stub launchctl was used" ok ok
+else
+  check "stub launchctl was used" bad ok
 fi
 
 if [[ "$failures" -ne 0 ]]; then
