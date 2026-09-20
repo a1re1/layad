@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "tw-*"]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --all-targets
+
+  python-and-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Standard library only: no torch, no model download.
+      - name: Worker bridge tests
+        run: python -m unittest discover -s python/tests -v
+      - name: Shell syntax
+        run: bash -n scripts/setup.sh scripts/service.sh scripts/smoke.sh tests/service_test.sh tests/scripts_offline_test.sh
+      - name: Service script tests (stubbed launchctl, temp HOME)
+        run: bash tests/service_test.sh
+      # No uv, no cargo build, no model download: setup.sh/smoke.sh run against
+      # stub executables in a throwaway repo and only their arguments and
+      # failure modes are asserted.
+      - name: Setup/smoke script tests (offline, stubbed tools)
+        run: bash tests/scripts_offline_test.sh
+
+# Note: no job downloads model weights or runs real inference. The real-model
+# smoke test (scripts/smoke.sh) is a local, opt-in check because it needs the
+# ~GB Laya checkpoint prepared by scripts/setup.sh.

@@ -1,0 +1,27 @@
+{
+  "state": [
+    {"role": "user", "content": "I was charged twice for my subscription and nobody has replied to my emails for a week."},
+    {"role": "agent", "content": "I am sorry about that. Let me look at the duplicate charge right away."}
+  ],
+  "questions": {
+    "intent": {
+      "type": "choice",
+      "instructions": "What does the customer most want right now?",
+      "criteria": {
+        "refund": "a refund for the duplicate charge",
+        "cancel": "to cancel the subscription",
+        "explain": "an explanation of what happened",
+        "other": "something else"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this for the customer?",
+      "criteria": ["not urgent", "somewhat urgent", "urgent", "extremely urgent"]
+    },
+    "human": {
+      "type": "noul",
+      "instructions": "Does the customer want to speak to a human agent?"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+# Direct dependencies of the resident Laya worker (python/worker.py).
+#
+# scripts/setup.sh compiles this file to python/requirements.txt with
+# `uv pip compile` for Python 3.11 and installs the result into .venv, so the
+# worker runs against exactly the versions this project was tested with.
+#
+# Pins are deliberate: upstream laya 0.3.4 requires torch>=2.0, transformers>=4.45
+# and huggingface_hub>=0.20, and an uncontrolled transformers major can break
+# checkpoint loading (see the tokenizer_config workarounds in laya/agent.py).
+
+laya==0.3.4
+torch==2.6.0
+transformers==4.49.0
+huggingface_hub==0.28.1
+safetensors==0.5.2
+numpy==2.0.2
