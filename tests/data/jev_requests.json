@@ -1,0 +1,44 @@
+[
+  {
+    "name": "classifier-three-primitives",
+    "method": "POST",
+    "url": "https://api.typesafe.ai/v1/systemone",
+    "content_type": "application/json",
+    "body": "{\"state\":\"GOAL: refund the duplicate charge PAGE: billing\",\"questions\":{\"action\":{\"type\":\"choice\",\"instructions\":\"what should the agent do next?\",\"criteria\":{\"refund\":\"issue a refund\",\"cancel\":\"cancel the subscription\"}},\"urgency\":{\"type\":\"score\",\"instructions\":\"how urgent is this?\",\"criteria\":[\"not urgent\",\"somewhat urgent\",\"very urgent\"]},\"human\":{\"type\":\"noul\",\"instructions\":\"does the user want a human?\"}}}"
+  },
+  {
+    "name": "state-null",
+    "method": "POST",
+    "url": "https://api.typesafe.ai/v1/systemone",
+    "content_type": "application/json",
+    "body": "{\"state\":null,\"questions\":{\"action\":{\"type\":\"choice\",\"instructions\":\"what next?\",\"criteria\":{\"refund\":\"refund it\",\"cancel\":\"cancel it\"}}}}"
+  },
+  {
+    "name": "choice-null-description",
+    "method": "POST",
+    "url": "https://api.typesafe.ai/v1/systemone",
+    "content_type": "application/json",
+    "body": "{\"state\":\"GOAL: refund PAGE: billing\",\"questions\":{\"action\":{\"type\":\"choice\",\"instructions\":\"what next?\",\"criteria\":{\"refund\":null,\"cancel\":\"cancel it\"}},\"handoff\":{\"type\":\"noul\",\"instructions\":\"a human?\"}}}"
+  },
+  {
+    "name": "score-two-null-criteria",
+    "method": "POST",
+    "url": "https://api.typesafe.ai/v1/systemone",
+    "content_type": "application/json",
+    "body": "{\"state\":\"customer is angry\",\"questions\":{\"urgency\":{\"type\":\"score\",\"instructions\":\"how urgent?\",\"criteria\":[null,null]}}}"
+  },
+  {
+    "name": "score-structured-criteria",
+    "method": "POST",
+    "url": "https://api.typesafe.ai/v1/systemone",
+    "content_type": "application/json",
+    "body": "{\"state\":{\"customer\":\"angry\"},\"questions\":{\"urgency\":{\"type\":\"score\",\"instructions\":[\"how\",\"urgent?\"],\"criteria\":[{\"label\":\"low\"},null]}}}"
+  },
+  {
+    "name": "model-and-extra-top-level-field",
+    "method": "POST",
+    "url": "https://api.typesafe.ai/v1/systemone",
+    "content_type": "application/json",
+    "body": "{\"model\":\"Laya-rl-agent\",\"trace_id\":\"0f0f\",\"state\":\"x\",\"questions\":{\"action\":{\"type\":\"noul\",\"instructions\":\"does the user want a human?\"}}}"
+  }
+]

@@ -109,6 +109,8 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/v1/predict", post(predict))
+        .route("/v1/systemone", post(systemone))
+        .route("/v1/models", get(models))
         .fallback(|| async { error_response(StatusCode::NOT_FOUND, "not_found", "unknown path") })
         .method_not_allowed_fallback(|| async {
             error_response(
@@ -201,18 +203,42 @@ fn readiness_label(readiness: &Readiness) -> &'static str {
     }
 }
 
-/// Prediction request: `{"state": <string|object|array>, "questions": {...}}`.
+/// Prediction request: `{"state": ..., "questions": {...}}`.
+///
+/// Deserialization is permissive on purpose: a Jev client always sends the
+/// resolved `model`, and its SDK forwards any additional top-level property the
+/// caller set. Those land in `extra` instead of failing the request. `model` is
+/// accepted and ignored — layad serves the single checkpoint its worker was
+/// started with.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PredictRequest {
     pub state: Value,
     pub questions: Map<String, Value>,
+    /// Top-level properties layad does not use (`model`, `trace_id`, ...).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Question types supported by the pinned upstream release.
 const QUESTION_TYPES: [&str; 3] = ["choice", "score", "noul"];
 
 async fn predict(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Response {
+    predict_impl(state, body, false).await
+}
+
+/// `POST /v1/systemone` — Jev's path for the same prediction.
+///
+/// The request is the one Jev accepts, byte for byte; the reply is projected
+/// onto the key set Jev's types declare (see [`jev_result`]).
+async fn systemone(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Response {
+    predict_impl(state, body, true).await
+}
+
+async fn predict_impl(
+    state: AppState,
+    body: Result<Bytes, BytesRejection>,
+    jev_shape: bool,
+) -> Response {
     let bytes = match body {
         Ok(bytes) => bytes,
         Err(rejection) => {
@@ -283,15 +309,26 @@ async fn predict(State(state): State<AppState>, body: Result<Bytes, BytesRejecti
         }
     };
 
+    let kinds = question_kinds(&request.questions);
     let params = json!({"state": request.state, "questions": request.questions});
     match worker.predict(params).await {
-        Ok(result) => json_response(StatusCode::OK, result),
+        Ok(result) => json_response(
+            StatusCode::OK,
+            if jev_shape {
+                jev_result(&kinds, result, state.config().model.clone())
+            } else {
+                result
+            },
+        ),
         Err(err) => worker_error_response(err),
     }
 }
 
 fn validate_state(state: &Value) -> Result<(), String> {
     match state {
+        // Jev's `EntryType` includes `null`, and upstream `serialize_state`
+        // renders it as the JSON literal `null`.
+        Value::Null => Ok(()),
         Value::String(text) => {
             if text.trim().is_empty() {
                 Err("state must not be an empty string".to_string())
@@ -357,33 +394,17 @@ fn validate_question(name: &str, question: &Value) -> Result<(), String> {
             QUESTION_TYPES.join(", ")
         ));
     }
-    match object.get("instructions") {
-        Some(Value::String(text)) if !text.trim().is_empty() => {}
-        Some(Value::String(_)) => return Err(format!("question {name:?} has empty instructions")),
-        Some(Value::Object(map)) if !map.is_empty() => {}
-        Some(Value::Object(_)) => return Err(format!("question {name:?} has empty instructions")),
-        Some(other) => {
-            return Err(format!(
-                "question {name:?} instructions must be a string or object, got {}",
-                kind_of(other)
-            ))
-        }
-        None => return Err(format!("question {name:?} is missing \"instructions\"")),
+    // `instructions` must be present, but any JSON value is legal: Jev types it
+    // as `EntryType` (string, object, array or null) and upstream renders
+    // strings verbatim and everything else as compact JSON.
+    if !object.contains_key("instructions") {
+        return Err(format!("question {name:?} is missing \"instructions\""));
     }
     match (kind, object.get("criteria")) {
+        // Criterion values are `EntryType`: a label may be undescribed (`null`
+        // or `""`) or structured JSON, and upstream renders every value.
         ("choice", Some(Value::Object(map))) if !map.is_empty() => Ok(()),
-        ("choice", Some(Value::Array(items))) if !items.is_empty() => {
-            if items
-                .iter()
-                .all(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
-            {
-                Ok(())
-            } else {
-                Err(format!(
-                    "question {name:?} criteria entries must be nonempty strings"
-                ))
-            }
-        }
+        ("choice", Some(Value::Array(items))) if !items.is_empty() => Ok(()),
         ("choice", Some(Value::Object(_))) | ("choice", Some(Value::Array(_))) => Err(format!(
             "question {name:?} needs at least one choice criterion"
         )),
@@ -394,18 +415,7 @@ fn validate_question(name: &str, question: &Value) -> Result<(), String> {
         ("choice", None) => Err(format!(
             "question {name:?} of type choice is missing \"criteria\""
         )),
-        ("score", Some(Value::Array(items))) if !items.is_empty() => {
-            if items
-                .iter()
-                .all(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
-            {
-                Ok(())
-            } else {
-                Err(format!(
-                    "question {name:?} criteria entries must be nonempty strings"
-                ))
-            }
-        }
+        ("score", Some(Value::Array(items))) if !items.is_empty() => Ok(()),
         ("score", Some(Value::Array(_))) => Err(format!(
             "question {name:?} needs at least one score criterion"
         )),
@@ -446,6 +456,115 @@ pub fn error_response(status: StatusCode, code: &str, message: impl Into<String>
 
 /// Serialize a JSON value with an explicit content type. Serialization of these
 /// shapes cannot fail, but a panic would be worse than a 500.
+/// Question name -> declared type, captured before the request is forwarded, so
+/// the reply can be projected onto Jev's per-question answer types.
+fn question_kinds(questions: &Map<String, Value>) -> Vec<(String, String)> {
+    questions
+        .iter()
+        .map(|(name, question)| {
+            (
+                name.clone(),
+                question
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Project a worker result onto Jev's `SystemOneResult` shape: exactly
+/// `{model, answers, usage}`, in that key set, with `usage` carrying Jev's two
+/// token counters.
+///
+/// The daemon's own `/v1/predict` reply is untouched — it keeps Laya's `action`
+/// blocks and the worker's fuller `usage` — so anything the worker adds beyond
+/// Jev's types is dropped here and only here. `model` falls back to the
+/// checkpoint this daemon was started with, so the key is never missing.
+fn jev_result(kinds: &[(String, String)], result: Value, fallback_model: String) -> Value {
+    let object = result.as_object();
+    let answers = object
+        .and_then(|map| map.get("answers"))
+        .and_then(Value::as_object);
+    let model = object
+        .and_then(|map| map.get("model"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or(fallback_model);
+    let usage = object
+        .and_then(|map| map.get("usage"))
+        .and_then(Value::as_object);
+    let counter = |key: &str| {
+        usage
+            .and_then(|map| map.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let projected = kinds
+        .iter()
+        .map(|(name, kind)| {
+            let answer = answers
+                .and_then(|map| map.get(name))
+                .cloned()
+                .unwrap_or(Value::Null);
+            (name.clone(), jev_answer(kind, &answer))
+        })
+        .collect();
+    json!({
+        "model": model,
+        "answers": Value::Object(projected),
+        "usage": {
+            "input_tokens": counter("input_tokens"),
+            "output_tokens": counter("output_tokens"),
+        },
+    })
+}
+
+/// The exact answer key set Jev declares for one question type. Upstream Laya
+/// adds an `action` block (and a `confidence` on `noul`) that Jev's types do not
+/// have, so those are dropped. A key the worker omitted becomes `null` rather
+/// than disappearing, so the shape does not depend on the worker's health.
+fn jev_answer(kind: &str, answer: &Value) -> Value {
+    let keys: &[&str] = match kind {
+        "noul" => &["type", "noul"],
+        "choice" => &["type", "choice", "confidence", "probabilities"],
+        "score" => &["type", "score", "confidence", "legend", "probabilities"],
+        _ => return answer.clone(),
+    };
+    let mut object = Map::new();
+    for key in keys {
+        object.insert(
+            (*key).to_string(),
+            answer.get(*key).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(object)
+}
+
+/// `GET /v1/models` — Jev's model list, with the one checkpoint this daemon
+/// keeps resident.
+async fn models(State(state): State<AppState>) -> Response {
+    let model = match state.worker() {
+        Some(worker) => match worker.info().await {
+            Some(info) => info.model,
+            None => state.config().model.clone(),
+        },
+        None => state.config().model.clone(),
+    };
+    json_response(
+        StatusCode::OK,
+        json!({
+            "models": [{
+                "name": model,
+                "description": "the checkpoint resident in this layad daemon",
+                // A local checkpoint path has no release date to report.
+                "release_date": "",
+            }],
+        }),
+    )
+}
+
 fn json_response(status: StatusCode, value: Value) -> Response {
     match serde_json::to_vec(&value) {
         Ok(body) => (
@@ -486,7 +605,8 @@ mod tests {
         assert!(validate_state(&json!({})).is_err());
         assert!(validate_state(&json!([])).is_err());
         assert!(validate_state(&json!(7)).is_err());
-        assert!(validate_state(&json!(null)).is_err());
+        // Jev's `EntryType` allows a null state; upstream renders it as "null".
+        assert!(validate_state(&json!(null)).is_ok());
     }
 
     #[test]
@@ -495,6 +615,12 @@ mod tests {
         assert!(validate_question("refund", &object).is_ok());
         let list = json!({"type": "choice", "instructions": "refund?", "criteria": ["yes", "no"]});
         assert!(validate_question("refund", &list).is_ok());
+        // Jev descriptions are `EntryType`: `null` leaves a label undescribed
+        // and structured values are rendered as JSON by upstream.
+        let undescribed = json!({"type": "choice", "instructions": "refund?", "criteria": {"refund": null, "cancel": "cancel it"}});
+        assert!(validate_question("refund", &undescribed).is_ok());
+        let structured = json!({"type": "choice", "instructions": "refund?", "criteria": [null, {"level": "high"}]});
+        assert!(validate_question("refund", &structured).is_ok());
     }
 
     #[test]
@@ -503,6 +629,12 @@ mod tests {
         assert!(validate_question("urgency", &score).is_ok());
         let noul = json!({"type": "noul", "instructions": "does the user want a human?"});
         assert!(validate_question("handoff", &noul).is_ok());
+        // Jev allows `instructions` to be any `EntryType` (here a list) and a
+        // `noul` to carry `{true, false}` descriptions with null values.
+        let structured = json!({"type": "score", "instructions": ["how urgent?"], "criteria": [null, {"level": "high"}]});
+        assert!(validate_question("urgency", &structured).is_ok());
+        let described = json!({"type": "noul", "instructions": {"q": "human?"}, "criteria": {"true": "yes", "false": null}});
+        assert!(validate_question("handoff", &described).is_ok());
     }
 
     #[test]
@@ -523,8 +655,8 @@ mod tests {
                 "at least one",
             ),
             (
-                json!({"type": "choice", "instructions": "x", "criteria": [""]}),
-                "nonempty",
+                json!({"type": "score", "instructions": "x", "criteria": []}),
+                "at least one",
             ),
             (
                 json!({"type": "score", "instructions": "x", "criteria": {"a": 1}}),
@@ -535,12 +667,8 @@ mod tests {
                 "missing \"criteria\"",
             ),
             (
-                json!({"type": "noul", "instructions": 12}),
-                "instructions must be",
-            ),
-            (
-                json!({"type": "choice", "instructions": "", "criteria": ["a"]}),
-                "empty instructions",
+                json!({"type": "noul", "criteria": {"true": "yes"}}),
+                "missing \"instructions\"",
             ),
         ];
         for (value, needle) in cases {

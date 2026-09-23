@@ -85,6 +85,22 @@ class WorkerModuleTests(unittest.TestCase):
         )
         self.assertEqual(state, {"customer": "angry"})
         self.assertIn("q", questions)
+        # Jev's `EntryType` allows a null state and non-string instructions, and
+        # `null` descriptions leave a criterion undescribed.
+        null_state, accepted = worker.validate_params(
+            {
+                "state": None,
+                "questions": {
+                    "q": {
+                        "type": "choice",
+                        "instructions": None,
+                        "criteria": {"refund": None, "cancel": {"level": "high"}},
+                    }
+                },
+            }
+        )
+        self.assertIsNone(null_state)
+        self.assertIn("q", accepted)
 
     def test_validate_params_rejects_bad_input(self):
         worker, _ = self.make_worker()
@@ -100,7 +116,7 @@ class WorkerModuleTests(unittest.TestCase):
             ),
             (
                 "needs instructions",
-                {"state": "x", "questions": {"q": {"type": "noul", "instructions": 7}}},
+                {"state": "x", "questions": {"q": {"type": "noul", "criteria": {"true": "yes"}}}},
             ),
         ]
         for message, params in cases:
