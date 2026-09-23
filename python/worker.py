@@ -172,7 +172,9 @@ class Worker:
         if not isinstance(params, dict):
             raise ValueError("params must be an object")
         state = params.get("state")
-        if not isinstance(state, (str, dict, list)):
+        # Jev's `EntryType` allows `null`, which upstream renders as the JSON
+        # literal; anything else must be a string, object or list.
+        if state is not None and not isinstance(state, (str, dict, list)):
             raise ValueError("state must be a string, object or list")
         if isinstance(state, str) and not state.strip():
             raise ValueError("state must not be an empty string")
@@ -190,7 +192,9 @@ class Worker:
                     f"question {name!r} has unsupported type {qtype!r}; "
                     f"expected one of {', '.join(QUESTION_TYPES)}"
                 )
-            if not isinstance(question.get("instructions"), (str, dict, list)):
+            # Jev types `instructions` as `EntryType` (string, object, array or
+            # null); upstream renders non-strings as compact JSON.
+            if "instructions" not in question:
                 raise ValueError(f"question {name!r} needs instructions")
         return state, questions
 

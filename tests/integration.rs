@@ -1293,3 +1293,257 @@ async fn assert_worker_hf_home(dir: &tempfile::TempDir, extra: &[&str], expected
     );
     worker.shutdown(Duration::from_secs(5)).await;
 }
+
+/// Send a raw body, byte for byte, so a captured client request is reproduced
+/// exactly rather than re-serialized.
+async fn send_raw(state: &AppState, path: &str, body: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let response = router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router answers");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            panic!(
+                "response body is not JSON ({err}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    };
+    (status, value)
+}
+
+/// `tests/data/jev_requests.json` holds request bodies captured from a real Jev
+/// client (the TypeSafe SDK, which posts to `/v1/systemone`). Every one of them
+/// must be accepted **byte identical** by layad, on Jev's path and on layad's
+/// own — including the top-level `model` (which layad resolves itself) and the
+/// `trace_id` the SDK forwards from the caller.
+#[tokio::test]
+async fn captured_jev_request_bodies_are_accepted_byte_identical() {
+    let (state, _worker) = ready_app(fake_config(&[
+        "--worker-arg",
+        "--mode",
+        "--worker-arg",
+        "normal",
+    ]))
+    .await;
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("tests/data")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("jev_") && name.ends_with(".json"))
+        })
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "no captured Jev requests under {dir:?}");
+    let mut cases: Vec<Value> = Vec::new();
+    for file in &files {
+        let raw = std::fs::read(file).expect("captured Jev requests");
+        let batch: Vec<Value> = serde_json::from_slice(&raw)
+            .unwrap_or_else(|err| panic!("{file:?} is not a JSON array of requests: {err}"));
+        cases.extend(batch);
+    }
+
+    // The capture must genuinely cover the shapes that made layad stricter than
+    // Jev: a null state, undescribed criteria and extra top-level fields.
+    let names: Vec<String> = cases
+        .iter()
+        .map(|case| case["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    for required in [
+        "classifier-three-primitives",
+        "state-null",
+        "choice-null-description",
+        "score-two-null-criteria",
+        "score-structured-criteria",
+        "model-and-extra-top-level-field",
+    ] {
+        assert!(
+            names.iter().any(|name| name == required),
+            "the capture lost its {required:?} case: {names:?}"
+        );
+    }
+
+    for case in &cases {
+        let name = case["name"].as_str().unwrap_or_default();
+        // The capture also covers Jev's read-only routes; those are checked by
+        // `models_reports_the_resident_checkpoint_in_jev_shape`.
+        if case["method"] != "POST" {
+            continue;
+        }
+        let content_type = case["content_type"].as_str().unwrap_or_default();
+        assert!(
+            content_type.starts_with("application/json"),
+            "{name} sent content-type {content_type:?}"
+        );
+        let body = case["body"]
+            .as_str()
+            .expect("the captured body is a string");
+        let url = case["url"].as_str().expect("url");
+        let captured_path = url
+            .find("/v1/")
+            .map(|start| &url[start..])
+            .unwrap_or("/v1/systemone");
+
+        let questions: Vec<String> = serde_json::from_str::<Value>(body)
+            .expect("captured body is JSON")
+            .get("questions")
+            .and_then(Value::as_object)
+            .expect("captured body has questions")
+            .keys()
+            .cloned()
+            .collect();
+
+        // Jev's own path and layad's path both take the captured bytes as-is.
+        for route in [captured_path, "/v1/predict"] {
+            let (status, value) = send_raw(&state, route, body).await;
+            assert_eq!(status, StatusCode::OK, "{name} -> {route}: {value}");
+            let answers = value["answers"].as_object().expect("answers object");
+            assert_eq!(
+                answers.keys().collect::<Vec<_>>().len(),
+                questions.len(),
+                "{name} -> {route} answered the wrong questions: {value}"
+            );
+            for question in &questions {
+                assert!(answers.contains_key(question), "{name} -> {route}: {value}");
+                assert!(
+                    answers[question]["type"].is_string(),
+                    "{name} -> {route}: {value}"
+                );
+            }
+        }
+    }
+}
+
+/// Jev's declared answer types: no `action` block on any primitive, no
+/// `confidence` on `noul`, and `model` plus `usage` at the top level.
+#[tokio::test]
+async fn systemone_answers_carry_jev_types_and_predict_keeps_the_raw_reply() {
+    let (state, _worker) = ready_app(fake_config(&[
+        "--worker-arg",
+        "--mode",
+        "--worker-arg",
+        "normal",
+    ]))
+    .await;
+
+    let body = json!({
+        "state": "x",
+        "questions": {
+            "intent": {
+                "type": "choice",
+                "instructions": "what does the user want?",
+                "criteria": {"refund": "refund it", "cancel": "cancel it"},
+            },
+            "urgency": {
+                "type": "score",
+                "instructions": "how urgent?",
+                "criteria": ["low", "high"],
+            },
+            "human": {"type": "noul", "instructions": "does the user want a human?"},
+        },
+    });
+
+    for route in ["/v1/predict", "/v1/systemone"] {
+        let (status, value) = send(&state, route, Some(body.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {value}");
+        if route == "/v1/systemone" {
+            // Jev's `SystemOneResult`: exactly these three keys, and `usage` is
+            // Jev's pair of integer counters rather than the worker's fuller
+            // usage object.
+            let mut top: Vec<&str> = value
+                .as_object()
+                .unwrap_or_else(|| panic!("{route}: {value}"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            top.sort_unstable();
+            assert_eq!(top, ["answers", "model", "usage"], "{route}: {value}");
+        }
+        assert!(value["model"].is_string(), "{route}: {value}");
+        assert!(
+            value["usage"]["input_tokens"].is_number(),
+            "{route}: {value}"
+        );
+        assert!(
+            value["usage"]["output_tokens"].is_number(),
+            "{route}: {value}"
+        );
+
+        let expected: [(&str, &[&str]); 3] = [
+            ("intent", &["choice", "confidence", "probabilities", "type"]),
+            (
+                "urgency",
+                &["confidence", "legend", "probabilities", "score", "type"],
+            ),
+            ("human", &["noul", "type"]),
+        ];
+        for (question, keys) in expected {
+            let answer = value["answers"][question]
+                .as_object()
+                .unwrap_or_else(|| panic!("{route}: no answer for {question}: {value}"));
+            if route == "/v1/systemone" {
+                let mut actual: Vec<&str> = answer.keys().map(String::as_str).collect();
+                actual.sort_unstable();
+                assert_eq!(actual, keys, "{route}: {question} shape changed: {value}");
+            } else {
+                // layad's own path keeps Laya's extra `action` block but must
+                // still carry every key Jev declares.
+                for key in keys {
+                    assert!(
+                        answer.contains_key(*key),
+                        "{route}: {question} lost {key:?}: {value}"
+                    );
+                }
+            }
+        }
+    }
+
+    // layad's own path still exposes Laya's `action` block; only the Jev path
+    // drops it, because Jev's types do not declare it.
+    let (_, raw) = send(&state, "/v1/predict", Some(body.clone())).await;
+    assert!(raw["answers"]["intent"].get("action").is_some(), "{raw}");
+    assert!(raw["answers"]["human"].get("action").is_some(), "{raw}");
+}
+
+/// Jev's `GET /v1/models` shape: `{"models": [{"name", "description",
+/// "release_date"}]}`.
+#[tokio::test]
+async fn models_reports_the_resident_checkpoint_in_jev_shape() {
+    let (state, _worker) = ready_app(fake_config(&[
+        "--worker-arg",
+        "--mode",
+        "--worker-arg",
+        "normal",
+    ]))
+    .await;
+
+    let (status, body) = send(&state, "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let models = body["models"].as_array().expect("models array");
+    assert_eq!(models.len(), 1, "{body}");
+    for key in ["name", "description", "release_date"] {
+        assert!(models[0].get(key).is_some(), "{body}");
+    }
+    assert!(models[0]["description"].is_string(), "{body}");
+    assert_eq!(models[0]["release_date"], "", "{body}");
+}

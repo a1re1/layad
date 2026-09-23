@@ -5,10 +5,12 @@ repeated predictions do not pay model load cost. Rust owns the HTTP surface and
 the worker process lifecycle; a persistent Python child owns the model and
 reuses upstream `laya` inference code unchanged.
 
-This is a small, local, single-user tool. It is deliberately *Jev-inspired*
-(typed decisions over a local endpoint) but it is **not wire-compatible with
-Jev**, and it makes no claims about benchmark performance or probability
-calibration.
+This is a small, local, single-user tool. It is *Jev-compatible at the wire
+level*: it serves Jev's `POST /v1/systemone` and `GET /v1/models` paths, accepts
+a Jev request body byte for byte, and answers with Jev's response shape (the
+same keys with the same types). The model is local Laya, so the *values* are
+Laya's own; this project still makes no claims about benchmark performance or
+probability calibration.
 
 ## What it does
 
@@ -219,12 +221,84 @@ Response:
     },
     "human": {"type": "noul", "noul": 3}
   },
-  "usage": {"id": "...", "model": "...", "device": "cpu", "elapsed_ms": 412}
+  "usage": {"input_tokens": 812, "output_tokens": 0}
 }
 ```
 
 Answer payloads are passthrough from upstream Laya — anything the upstream
 distribution returns is preserved rather than recomputed or rounded here.
+Request bodies are permissive in the Jev direction: unknown top-level fields
+(`model`, `trace_id`, ...) are accepted and ignored, since Jev's SDK always
+sends the resolved `model` and forwards any extra property the caller set.
+`model` cannot select anything here — a layad daemon keeps exactly one
+checkpoint resident.
+
+### `POST /v1/systemone`
+
+Jev's path for the same prediction. It takes the **identical request body** as
+`/v1/predict` and answers with Jev's `SystemOneResult` shape:
+
+```json
+{
+  "model": "Laya-rl-agent",
+  "answers": {
+    "intent": {
+      "type": "choice",
+      "choice": "refund",
+      "confidence": 0.81,
+      "probabilities": {"refund": 0.81, "cancel": 0.19}
+    },
+    "urgency": {
+      "type": "score",
+      "score": 2.04,
+      "confidence": 0.62,
+      "legend": {"0": "not urgent", "1": "somewhat urgent", "2": "very urgent"},
+      "probabilities": {"0": 0.1, "1": 0.76, "2": 0.14}
+    },
+    "human": {"type": "noul", "noul": 0.25}
+  },
+  "usage": {"input_tokens": 812, "output_tokens": 0}
+}
+```
+
+Differences from `/v1/predict` are confined to the answer payloads, because
+upstream Laya returns more than Jev's types declare:
+
+* the `action` block Laya adds to every answer is **not** part of Jev's
+  `NoulResponse`/`ChoiceResponse`/`ScoreResponse` and is dropped here only;
+* `noul` carries just `{type, noul}` — Jev's `NoulResponse` has no
+  `confidence`;
+* answers follow the request's question names and declared types, and a value
+  Laya omitted is reported as `null` rather than disappearing, so the shape of
+  a 200 never depends on the worker's health;
+* `model` and `usage` are exactly Jev's: the reply carries one `model` string
+  (the worker's own, else the configured checkpoint path) and a `usage` with
+  just the `input_tokens`/`output_tokens` integer pair — a counter the worker
+  does not report is `0`, and the worker's richer usage object stays visible on
+  `/v1/predict` only.
+
+Every other route, the error bodies and the status codes are layad's own (see
+below) and are identical on both prediction paths.
+
+### `GET /v1/models`
+
+Jev's model list, in Jev's shape, with the one checkpoint this daemon keeps
+resident:
+
+```json
+{
+  "models": [
+    {
+      "name": ".layad/model",
+      "description": "the checkpoint resident in this layad daemon",
+      "release_date": ""
+    }
+  ]
+}
+```
+
+`release_date` is empty because a local checkpoint path has no release date;
+the field is present so the shape stays complete.
 
 ### Errors
 
@@ -358,8 +432,10 @@ and a stub `launchctl`.
   restarting the process, not by hot-swapping models in place.
 * Upstream Laya behavior (prompt format, sampling, calibration) is inherited
   as-is; this project does not tune or validate it.
-* Not Jev-compatible: request/response shapes are inspired by Jev's typed
-  decisions but are their own thing.
+* Jev compatibility covers the wire contract only: `POST /v1/systemone` and
+  `GET /v1/models` accept Jev request bodies and answer with Jev's response
+  shape. `POST /v1/predict`, `/readyz` and `/healthz` are layad's own; values
+  come from the local Laya checkpoint, not from Jev.
 
 ## Cleanup
 
