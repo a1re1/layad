@@ -311,16 +311,23 @@ Every error is `{"error":{"code":"...","message":"..."}}` with a status code:
 | 404 | `not_found` | unknown path (JSON, not an empty body) |
 | 405 | `method_not_allowed` | wrong method (JSON, not an empty body) |
 | 413 | `body_too_large` | body over `--max-body-bytes` |
-| 429 | `overloaded` | too many questions or too many concurrent requests |
+| 429 | `overloaded` | more concurrent requests than `--max-concurrent` |
 | 503 | `unavailable` | worker not ready, worker died, or request canceled |
 | 504 | `timeout` | inference exceeded `--inference-timeout-ms` |
 
 ### Limits
 
-Defaults: 1 MiB body, 32 questions, 4 concurrent requests, 8 MiB worker reply
+Defaults: 1 MiB body, 256 questions, 64 concurrent requests, 8 MiB worker reply
 cap, 600 s startup timeout, 60 s inference timeout, 10 s shutdown timeout.
-Requests beyond a limit get `429`/`413` rather than being queued
+Requests beyond a limit get `400`/`429`/`413` rather than being queued
 unboundedly.
+
+Both defaults are sized for the caller that motivates the Jev shape: a skill
+classifier posts **one `noul` question per candidate skill in a single
+request**, and **one request per authored skill concurrently**, so the defaults
+cover a pool of a few dozen skills. A batch over `--max-questions` is refused
+with `400` and a fan-out over `--max-concurrent` with `429`; a larger pool needs
+both flags raised.
 
 ## Smoke test (real model)
 
