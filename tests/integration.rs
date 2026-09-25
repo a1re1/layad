@@ -1547,3 +1547,134 @@ async fn models_reports_the_resident_checkpoint_in_jev_shape() {
     assert!(models[0]["description"].is_string(), "{body}");
     assert_eq!(models[0]["release_date"], "", "{body}");
 }
+
+/// The body a skill classifier posts: the resolved `model` plus `noul`
+/// questions whose identity travels in a structured `instructions` object
+/// (Jev types `instructions` as any JSON value). Both of layad's prediction
+/// routes must take it as-is.
+#[tokio::test]
+async fn classifier_shaped_skill_questions_are_accepted_on_both_routes() {
+    let (state, _worker) = ready_app(fake_config(&[
+        "--worker-arg",
+        "--mode",
+        "--worker-arg",
+        "normal",
+    ]))
+    .await;
+
+    let body = json!({
+        "model": "laya-rl-agent",
+        "state": "GOAL: refund the duplicate charge",
+        "questions": {
+            "skill_0": {
+                "type": "noul",
+                "instructions": {
+                    "question": "Would following the skill `skill` help complete the current task described in the state?",
+                    "skill": {"name": "create-skill", "description": "Author a new skill"}
+                }
+            }
+        }
+    })
+    .to_string();
+
+    for path in ["/v1/predict", "/v1/systemone"] {
+        let (status, value) = send_raw(&state, path, &body).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {value}");
+        assert_eq!(
+            value["answers"]["skill_0"]["type"],
+            json!("noul"),
+            "{path}: {value}"
+        );
+        assert!(
+            value["answers"]["skill_0"]["noul"].is_number(),
+            "{path}: {value}"
+        );
+    }
+
+    // Jev's projection drops the `action` block upstream Laya adds; layad's own
+    // route passes it through, so the same body answers on both.
+    let (_, jev) = send_raw(&state, "/v1/systemone", &body).await;
+    assert!(
+        jev["answers"]["skill_0"].get("action").is_none(),
+        "{jev}"
+    );
+    let (_, own) = send_raw(&state, "/v1/predict", &body).await;
+    assert!(
+        own["answers"]["skill_0"].get("action").is_some(),
+        "{own}"
+    );
+}
+
+/// One candidate per named question: a pool of this size must fit in the
+/// default request, not be refused with `400`.
+#[tokio::test]
+async fn a_full_skill_pool_batch_is_not_refused() {
+    let (state, _worker) = ready_app(fake_config(&[
+        "--worker-arg",
+        "--mode",
+        "--worker-arg",
+        "normal",
+    ]))
+    .await;
+
+    let mut questions = serde_json::Map::new();
+    for index in 0..64 {
+        questions.insert(
+            format!("skill_{index}"),
+            json!({
+                "type": "noul",
+                "instructions": {
+                    "question": "Would following the skill `skill` help?",
+                    "skill": {"name": format!("skill-{index}"), "description": "a candidate"}
+                }
+            }),
+        );
+    }
+
+    let (status, body) = send(
+        &state,
+        "/v1/predict",
+        Some(json!({
+            "model": "laya-rl-agent",
+            "state": "GOAL: refund the duplicate charge",
+            "questions": questions,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["answers"].as_object().map(serde_json::Map::len),
+        Some(64),
+        "{body}"
+    );
+}
+
+/// The fan-out such a caller makes: one request per authored skill, all at
+/// once. Every one of them must be admitted instead of answered `429`.
+#[tokio::test]
+async fn a_skill_pool_fanout_is_admitted_not_refused() {
+    let (state, _worker) = ready_app(fake_config(&[
+        "--worker-arg",
+        "--mode",
+        "--worker-arg",
+        "slow-inference",
+        "--worker-arg",
+        "--delay",
+        "--worker-arg",
+        "0.2",
+    ]))
+    .await;
+
+    let mut handles = Vec::new();
+    for index in 0..24 {
+        let state = state.clone();
+        handles.push(tokio::spawn(async move {
+            send(&state, "/v1/predict", Some(prediction(&format!("burst {index}")))).await
+        }));
+    }
+
+    for handle in handles {
+        let (status, value) = handle.await.expect("fan-out task joins");
+        assert_eq!(status, StatusCode::OK, "fan-out request was refused: {value}");
+    }
+}

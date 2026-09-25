@@ -169,11 +169,20 @@ pub struct Cli {
     pub max_body_bytes: usize,
 
     /// Maximum number of named questions per request.
-    #[arg(long, env = "LAYAD_MAX_QUESTIONS", default_value_t = 32)]
+    ///
+    /// A skill-classifier caller posts one question per candidate skill in a
+    /// single request, so the default leaves room for a pool of a few dozen.
+    #[arg(long, env = "LAYAD_MAX_QUESTIONS", default_value_t = 256)]
     pub max_questions: usize,
 
     /// Maximum number of predictions executing at once.
-    #[arg(long, env = "LAYAD_MAX_CONCURRENT", default_value_t = 4)]
+    ///
+    /// This is admission control, not parallel inference: the worker answers
+    /// one request at a time and the rest queue behind it. The default admits
+    /// the one-request-per-authored-skill fan-out such a caller makes; a
+    /// request beyond the limit is refused with `429` rather than queueing
+    /// without bound.
+    #[arg(long, env = "LAYAD_MAX_CONCURRENT", default_value_t = 64)]
     pub max_concurrent: usize,
 
     /// Maximum worker response frame size in bytes.
@@ -347,6 +356,10 @@ mod tests {
         assert_eq!(config.checkpoint.subfolder(), None);
         assert_eq!(config.device, Device::Cpu);
         assert!(config.fail_fast);
+        // A classifier pool (one question per candidate, one request per
+        // authored skill) must fit the defaults without raising flags.
+        assert!(config.max_questions >= 64, "{}", config.max_questions);
+        assert!(config.max_concurrent >= 24, "{}", config.max_concurrent);
         let (program, args) = config.worker_command();
         assert!(program.to_string_lossy().contains("python"));
         assert_eq!(args[0], "python/worker.py");
