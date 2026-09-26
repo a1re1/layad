@@ -493,7 +493,10 @@ mod tests {
             vec!["--backend", "torch", "--device", "gpu"],
         ] {
             let err = Config::try_from(cli(&args)).unwrap_err();
-            assert!(err.contains("--device") && err.contains("backend"), "{args:?}: {err}");
+            assert!(
+                err.contains("--device") && err.contains("backend"),
+                "{args:?}: {err}"
+            );
         }
         // The per-backend device sets themselves stay accepted.
         for args in [
