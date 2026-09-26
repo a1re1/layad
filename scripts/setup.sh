@@ -12,8 +12,9 @@
 #
 # Environment overrides:
 #   LAYAD_CHECKPOINT=english|multilingual|typed-decisions   (default english)
-#   LAYAD_DEVICE=cpu|mps|cuda|auto                         (default cpu)
-#   LAYAD_MODEL_REPO=convaiinnovations/laya
+#   LAYAD_BACKEND=mlx|torch                                (default mlx)
+#   LAYAD_DEVICE=auto|cpu|gpu|mps|cuda                     (default auto)
+#   LAYAD_MODEL_REPO=aac6fef/laya-mlx
 #   LAYAD_RECOMPILE=1    recompile python/requirements.txt from the .in file
 #   LAYAD_SKIP_DOWNLOAD=1  skip the checkpoint download (already present)
 #   LAYAD_SKIP_WARM=1    skip the warmup/verification run
@@ -27,8 +28,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 CHECKPOINT="${LAYAD_CHECKPOINT:-english}"
-DEVICE="${LAYAD_DEVICE:-cpu}"
-MODEL_REPO="${LAYAD_MODEL_REPO:-convaiinnovations/laya}"
+BACKEND="${LAYAD_BACKEND:-mlx}"
+DEVICE="${LAYAD_DEVICE:-auto}"
+MODEL_REPO="${LAYAD_MODEL_REPO:-aac6fef/laya-mlx}"
 PY_VERSION="3.11"
 VENV="$ROOT/.venv"
 LAYAD_HOME="$ROOT/.layad"
@@ -50,9 +52,14 @@ case "$CHECKPOINT" in
   *) die "LAYAD_CHECKPOINT must be english, multilingual or typed-decisions (got '$CHECKPOINT')" ;;
 esac
 
+case "$BACKEND" in
+  mlx | torch) ;;
+  *) die "LAYAD_BACKEND must be mlx or torch (got '$BACKEND')" ;;
+esac
+
 case "$DEVICE" in
-  cpu | mps | cuda | auto) ;;
-  *) die "LAYAD_DEVICE must be cpu, mps, cuda or auto (got '$DEVICE')" ;;
+  auto | cpu | gpu | mps | cuda) ;;
+  *) die "LAYAD_DEVICE must be auto, cpu, gpu, mps or cuda (got '$DEVICE')" ;;
 esac
 
 # ---------------------------------------------------------------- prerequisites
@@ -79,7 +86,7 @@ actual_version="$("$VENV_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2
 
 # --------------------------------------------------------- pinned dependencies
 if [[ -n "${LAYAD_RECOMPILE:-}" || ! -f "$REQUIREMENTS" ]]; then
-  log "compiling pinned requirements for Python $PY_VERSION (torch wheels are large)"
+  log "compiling pinned requirements for Python $PY_VERSION (the MLX wheels are small)"
   compile_args=(--python-version "$PY_VERSION" --generate-hashes --output-file "$REQUIREMENTS")
   # uv only accepts its own target-triple names. sysconfig reports a platform
   # string such as "macosx-14.0-arm64", which uv rejects; map the host to a
@@ -147,7 +154,7 @@ fi
 # ------------------------------------------- warm weights AND tokenizer/encoder
 if [[ -z "${LAYAD_SKIP_WARM:-}" ]]; then
   log "loading and warming the model (weights, tokenizer and encoder caches are written into .layad/hf)"
-  warm_args=(--model "$MODEL_DIR" --device "$DEVICE")
+  warm_args=(--model "$MODEL_DIR" --device "$DEVICE" --backend "$BACKEND")
   if [[ "$CHECKPOINT" != "english" ]]; then
     warm_args+=(--subfolder "$CHECKPOINT")
   fi
@@ -180,7 +187,7 @@ fi
 log "setup complete"
 log "paths: .layad/model (checkpoint), .layad/hf (cache, exported as HF_HOME=$HF_HOME)"
 log "foreground run:"
-log "  ./target/release/layad --model .layad/model --checkpoint $CHECKPOINT --device $DEVICE"
+log "  ./target/release/layad --model .layad/model --checkpoint $CHECKPOINT --device $DEVICE --backend $BACKEND"
 if [[ "$CHECKPOINT" != "english" ]]; then
   log "worker directly: ./.venv/bin/python python/worker.py --model .layad/model --subfolder $CHECKPOINT"
 else

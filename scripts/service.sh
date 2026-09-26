@@ -15,7 +15,8 @@
 # Environment overrides:
 #   LAYAD_LABEL   bundle label              (default dev.layad.daemon)
 #   LAYAD_BIND    bind address             (default 127.0.0.1:8787)
-#   LAYAD_DEVICE  cpu|mps|cuda|auto        (default cpu)
+#   LAYAD_BACKEND mlx|torch               (default mlx)
+#   LAYAD_DEVICE  auto|cpu|gpu|mps|cuda    (default auto)
 #   LAYAD_CHECKPOINT english|multilingual|typed-decisions (default english;
 #                    a non-English checkpoint selects that model subfolder)
 #   LAYAD_LOG     tracing filter           (default info)
@@ -31,7 +32,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="${LAYAD_LABEL:-dev.layad.daemon}"
 BIND="${LAYAD_BIND:-127.0.0.1:8787}"
-DEVICE="${LAYAD_DEVICE:-cpu}"
+BACKEND="${LAYAD_BACKEND:-mlx}"
+DEVICE="${LAYAD_DEVICE:-auto}"
 CHECKPOINT="${LAYAD_CHECKPOINT:-english}"
 LOG_FILTER="${LAYAD_LOG:-info}"
 LAYAD_HOME_DIR="${LAYAD_HOME_DIR:-$ROOT/.layad}"
@@ -71,9 +73,13 @@ die() {
 case "$LABEL" in
   '' | *[!A-Za-z0-9._-]* | .* | *..* | *.) die "LAYAD_LABEL must be dotted components of letters, digits, '_' and '-' (got '$LABEL')" ;;
 esac
+case "$BACKEND" in
+  mlx | torch) ;;
+  *) die "LAYAD_BACKEND must be mlx or torch (got '$BACKEND')" ;;
+esac
 case "$DEVICE" in
-  cpu | mps | cuda | auto) ;;
-  *) die "LAYAD_DEVICE must be cpu, mps, cuda or auto (got '$DEVICE')" ;;
+  auto | cpu | gpu | mps | cuda) ;;
+  *) die "LAYAD_DEVICE must be auto, cpu, gpu, mps or cuda (got '$DEVICE')" ;;
 esac
 case "$CHECKPOINT" in
   english | multilingual | typed-decisions) ;;
@@ -118,6 +124,8 @@ render_plist() {
   printf '    <string>%s</string>\n' "$(xml_escape "$CHECKPOINT")"
   printf '    <string>%s</string>\n' "$(xml_escape "--device")"
   printf '    <string>%s</string>\n' "$(xml_escape "$DEVICE")"
+  printf '    <string>%s</string>\n' "$(xml_escape "--backend")"
+  printf '    <string>%s</string>\n' "$(xml_escape "$BACKEND")"
   printf '    <string>%s</string>\n' "$(xml_escape "--log")"
   printf '    <string>%s</string>\n' "$(xml_escape "$LOG_FILTER")"
   printf '%s\n' '  </array>'

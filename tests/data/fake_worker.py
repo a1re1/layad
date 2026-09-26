@@ -66,13 +66,22 @@ def parse_args(argv):
     parser.add_argument("--mode", default="normal")
     parser.add_argument("--model", default="fake/model")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--backend", default="mlx")
     parser.add_argument("--subfolder", default=None)
     parser.add_argument("--delay", type=float, default=None)
     parser.add_argument("--reply-id", default="999")
     parser.add_argument("--pid-file", default=None)
     parser.add_argument("--env-file", default=None)
     parser.add_argument("--gap", type=float, default=0.25)
-    return parser.parse_args(argv)
+    parsed = parser.parse_args(argv)
+    # "auto" is a request, not an answer: a real worker reports the device it
+    # resolved, so the fake one does too (MLX picks the Apple GPU; the torch
+    # path has no CUDA here and lands on CPU).
+    device = parsed.device
+    if device == "auto":
+        device = "gpu" if parsed.backend == "mlx" else "cpu"
+    setattr(parsed, "resolved_device", device)
+    return parsed
 
 
 def answer_for(name, question):
@@ -160,6 +169,7 @@ def main(argv):
         keys = [
             "HF_HOME",
             "LAYAD_MODEL",
+            "LAYAD_BACKEND",
             "LAYAD_DEVICE",
             "LAYAD_CHECKPOINT",
             "HF_TOKEN",
@@ -195,8 +205,9 @@ def main(argv):
                 "pid": os.getpid(),
                 "model": args.model,
                 "checkpoint": args.subfolder or "english",
-                "device": args.device,
+                "device": args.resolved_device,
                 "requested_device": args.device,
+                "backend": args.backend,
                 "laya_version": "fake",
                 "warmup": ["choice", "score", "noul"],
             }

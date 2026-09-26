@@ -164,6 +164,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
                 "checkpoint": info.checkpoint,
                 "device": info.device,
                 "requested_device": info.requested_device,
+                "backend": info.backend,
                 "laya_version": info.laya_version,
                 "worker_pid": info.pid,
                 "worker_identity": info.identity(),

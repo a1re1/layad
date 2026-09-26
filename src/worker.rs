@@ -121,6 +121,8 @@ pub struct WorkerInfo {
     pub checkpoint: String,
     pub device: String,
     pub requested_device: String,
+    /// Inference stack the worker loaded (`mlx` or `torch`).
+    pub backend: String,
     pub laya_version: String,
     pub warmup: Vec<String>,
 }
@@ -133,6 +135,7 @@ impl Default for WorkerInfo {
             checkpoint: "english".to_string(),
             device: "unknown".to_string(),
             requested_device: "unknown".to_string(),
+            backend: String::new(),
             laya_version: String::new(),
             warmup: Vec::new(),
         }
@@ -177,6 +180,7 @@ impl WorkerInfo {
                 }
             },
             requested_device: s("requested_device"),
+            backend: s("backend"),
             laya_version: s("laya_version"),
             warmup,
         }
@@ -1051,6 +1055,10 @@ fn worker_env(config: &Config) -> HashMap<String, String> {
         config.device.as_str().to_string(),
     );
     env.insert(
+        "LAYAD_BACKEND".to_string(),
+        config.backend.as_str().to_string(),
+    );
+    env.insert(
         "LAYAD_CHECKPOINT".to_string(),
         config.checkpoint.as_str().to_string(),
     );
@@ -1206,6 +1214,8 @@ mod tests {
             "layad",
             "--python-env",
             "HF_HUB_OFFLINE=1",
+            "--backend",
+            "torch",
             "--device",
             "mps",
         ]);

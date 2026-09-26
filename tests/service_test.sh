@@ -196,6 +196,23 @@ case "$multilingual_plist" in
   *) check "a non-English plist does not quietly say english" ok ok ;;
 esac
 
+default_plist="$(bash "$SERVICE" plist 2>/dev/null || true)"
+case "$default_plist" in
+  *"<string>--backend</string>"*"<string>mlx</string>"*)
+    check "the plist defaults to the MLX backend" ok ok ;;
+  *) check "the plist defaults to the MLX backend" bad ok ;;
+esac
+case "$default_plist" in
+  *"<string>--device</string>"*"<string>auto</string>"*)
+    check "the plist lets the backend choose the device" ok ok ;;
+  *) check "the plist lets the backend choose the device" bad ok ;;
+esac
+if LAYAD_BACKEND=bogus bash "$SERVICE" plist >/dev/null 2>&1; then
+  check "an unknown backend is refused" bad ok
+else
+  check "an unknown backend is refused" ok ok
+fi
+
 # ------------------- install / ownership / unload, in a stubbed worktree copy
 # service.sh derives every path from its own location, so a copy inside a
 # throwaway repo lets install run with stub python and binary executables. No

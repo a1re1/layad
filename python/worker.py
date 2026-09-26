@@ -14,17 +14,23 @@ Protocol (one JSON object per line):
 
 Rules this file keeps:
 
-* stdout carries protocol frames *only*. Anything Laya, PyTorch or transformers
-  print (including C-level writes to fd 1) is redirected to stderr before the
-  library is imported, so a stray ``print`` can never corrupt the stream.
+* stdout carries protocol frames *only*. Anything the model stack (MLX Metal,
+  PyTorch) prints — including C-level writes to fd 1 — is redirected to stderr
+  before the library is imported, so a stray ``print`` can never corrupt the
+  stream.
 * A malformed frame or a dead-end inference error is fatal: the process exits
   non-zero and the daemon fails closed rather than answering with state it does
   not trust.
 * Request-level problems (bad question structure, upstream validation errors)
   are reported with the request id so the worker stays usable.
 
-Inference is delegated to upstream ``laya`` (0.3.4): this file does not
-reimplement the model.
+Inference is delegated to whichever backend is selected (``--backend``, default
+``mlx``) and nothing here reimplements the model:
+
+* ``mlx`` (default): the native Apple MLX port ``laya_mlx`` (0.2.0), whose
+  checkpoint is the ``aac6fef/laya-mlx`` repository. Apple silicon only.
+* ``torch``: upstream ``laya`` (0.3.4) on PyTorch/transformers, the only
+  backend that runs off Apple silicon.
 """
 
 from __future__ import annotations
@@ -71,17 +77,30 @@ WARMUP_QUESTIONS = {
 }
 
 
+# Inference stacks this worker can drive. ``mlx`` is the Apple silicon default;
+# ``torch`` keeps the upstream path for hosts without MLX.
+BACKENDS = ("mlx", "torch")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Resident Laya worker for layad")
-    parser.add_argument("--model", default=os.environ.get("LAYAD_MODEL", "convaiinnovations/laya"))
-    parser.add_argument("--device", default=os.environ.get("LAYAD_DEVICE", "cpu"))
+    parser.add_argument("--model", default=os.environ.get("LAYAD_MODEL", "aac6fef/laya-mlx"))
+    parser.add_argument("--backend", default=os.environ.get("LAYAD_BACKEND", "mlx"))
+    # "auto" means "let the stack choose" (MLX: GPU then CPU; PyTorch: CUDA,
+    # MPS, then CPU), which is what both libraries treat as the default.
+    parser.add_argument("--device", default=os.environ.get("LAYAD_DEVICE", "auto"))
     parser.add_argument("--subfolder", default=None)
     parser.add_argument(
         "--no-warmup",
         action="store_true",
         help="load the model but skip the warmup forward pass (debugging only)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # Validated here rather than through argparse's `choices` so a bad
+    # LAYAD_BACKEND fails the same way a bad --backend does.
+    if args.backend not in BACKENDS:
+        parser.error(f"--backend must be one of {', '.join(BACKENDS)} (got {args.backend!r})")
+    return args
 
 
 def isolate_protocol_stream():
@@ -145,16 +164,31 @@ class Worker:
 
     def load(self):
         started = time.monotonic()
-        log(f"importing laya (model={self.args.model!r} device={self.args.device!r})")
-        import laya  # noqa: PLC0415 - imported after stdout is isolated on purpose
+        backend = self.args.backend
+        log(f"importing {backend} backend (model={self.args.model!r} device={self.args.device!r})")
+        if backend == "mlx":
+            # Native Apple MLX. It spells "let the library choose" as None and
+            # validates the rest against gpu/metal/cpu, so "auto" is translated
+            # here exactly as it is for upstream laya.
+            import laya_mlx  # noqa: PLC0415 - imported after stdout is isolated on purpose
 
-        version = getattr(laya, "__version__", "unknown")
-        log(f"laya {version}; loading checkpoint")
-        agent = laya.load(
-            self.args.model,
-            device=None if self.args.device == "auto" else self.args.device,
-            subfolder=self.args.subfolder,
-        )
+            version = getattr(laya_mlx, "__version__", "unknown")
+            log(f"laya_mlx {version}; loading checkpoint")
+            agent = laya_mlx.load(
+                self.args.model,
+                device=None if self.args.device == "auto" else self.args.device,
+                subfolder=self.args.subfolder,
+            )
+        else:
+            import laya  # noqa: PLC0415 - imported after stdout is isolated on purpose
+
+            version = getattr(laya, "__version__", "unknown")
+            log(f"laya {version}; loading checkpoint")
+            agent = laya.load(
+                self.args.model,
+                device=None if self.args.device == "auto" else self.args.device,
+                subfolder=self.args.subfolder,
+            )
         log(f"checkpoint loaded in {time.monotonic() - started:.1f}s")
         return agent
 
@@ -253,6 +287,57 @@ def module_version(name: str) -> str:
     return getattr(module, "__version__", "unknown") if module else "unknown"
 
 
+def backend_version(backend: str) -> str:
+    """Version of the inference stack that was actually imported."""
+    names = ("laya_mlx", "mlx.core") if backend == "mlx" else ("laya", "torch")
+    for name in names:
+        version = module_version(name)
+        if version != "unknown":
+            return version
+    return "unknown"
+
+
+def device_label(agent) -> str:
+    """Actual device of a loaded agent, in a shape both stacks label plainly.
+
+    PyTorch exposes it as a string (``torch.device("cpu").type``); MLX exposes
+    a ``DeviceType`` enum member whose string form (``DeviceType.gpu``) has to
+    be reduced to the device name.
+    """
+    value = getattr(agent, "device", None)
+    if value is None:
+        return "unknown"
+    for attr in ("type", "device"):
+        candidate = getattr(value, attr, None)
+        if candidate is None:
+            continue
+        text = candidate if isinstance(candidate, str) else str(candidate)
+        if not isinstance(candidate, str) and _looks_like_repr(text):
+            continue
+        if text:
+            return _plain_device_name(text)
+    return _plain_device_name(str(value))
+
+
+def _looks_like_repr(text: str) -> bool:
+    """Reject a nested object's repr so its own attributes get a chance."""
+    return text.startswith("Device(")
+
+
+def _plain_device_name(text: str) -> str:
+    """Reduce a stack's device label to a plain name.
+
+    ``torch.device("cpu")`` already yields ``"cpu"``. MLX yields its enum or
+    repr — ``DeviceType.gpu`` / ``Device(gpu, 0)`` — so both are reduced to the
+    device name and anything unparseable is passed through verbatim.
+    """
+    if "(" in text and text.rstrip().endswith(")"):
+        text = text[text.index("(") + 1 : text.rindex(")")].split(",")[0].strip()
+    elif "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text or "unknown"
+
+
 def main(argv: list[str]) -> int:
     stream = isolate_protocol_stream()
     args = parse_args(argv)
@@ -289,7 +374,7 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    device = getattr(getattr(agent, "device", None), "type", None) or "unknown"
+    device = device_label(agent)
     worker.emit(
         {
             "ready": True,
@@ -299,9 +384,9 @@ def main(argv: list[str]) -> int:
             "checkpoint": args.subfolder or "english",
             "device": device,
             "requested_device": args.device,
-            "laya_version": module_version("laya"),
-            "torch_version": module_version("torch"),
-            "transformers_version": module_version("transformers"),
+            "backend": args.backend,
+            "laya_version": backend_version(args.backend),
+            "mlx_version": module_version("mlx.core"),
             "python_version": sys.version.split()[0],
             "warmup": warmup,
         }

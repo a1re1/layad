@@ -17,7 +17,8 @@
 #   LAYAD_SMOKE_PORT  port to bind                   (default 8791)
 #   LAYAD_SMOKE_DEADLINE  readiness deadline, seconds (default 900)
 #   LAYAD_SMOKE_HTTP_TIMEOUT  per-request curl cap, seconds (default 300)
-#   LAYAD_DEVICE      cpu|mps|cuda|auto              (default cpu)
+#   LAYAD_BACKEND     mlx|torch                      (default mlx)
+#   LAYAD_DEVICE      auto|cpu|gpu|mps|cuda          (default auto)
 #
 # Requirements: scripts/setup.sh has been run (model + cache + release binary).
 set -euo pipefail
@@ -33,6 +34,8 @@ PORT="${LAYAD_SMOKE_PORT:-8791}"
 READY_DEADLINE="${LAYAD_SMOKE_DEADLINE:-900}"
 HTTP_TIMEOUT="${LAYAD_SMOKE_HTTP_TIMEOUT:-300}"
 CHECKPOINT="${LAYAD_CHECKPOINT:-english}"
+BACKEND="${LAYAD_BACKEND:-mlx}"
+DEVICE="${LAYAD_DEVICE:-auto}"
 
 log() { printf '[smoke] %s\n' "$*" >&2; }
 die() {
@@ -43,6 +46,14 @@ die() {
 case "$CHECKPOINT" in
   english | multilingual | typed-decisions) ;;
   *) die "LAYAD_CHECKPOINT must be english, multilingual or typed-decisions (got '$CHECKPOINT')" ;;
+esac
+case "$BACKEND" in
+  mlx | torch) ;;
+  *) die "LAYAD_BACKEND must be mlx or torch (got '$BACKEND')" ;;
+esac
+case "$DEVICE" in
+  auto | cpu | gpu | mps | cuda) ;;
+  *) die "LAYAD_DEVICE must be auto, cpu, gpu, mps or cuda (got '$DEVICE')" ;;
 esac
 # The selected checkpoint alone decides the subfolder: a non-English
 # checkpoint is a subfolder of the model directory, English is its root.
@@ -149,7 +160,8 @@ HF_HOME="$LAYAD_HOME/hf" \
   --python "$PYTHON" \
   --model "$MODEL" \
   --checkpoint "$CHECKPOINT" \
-  --device "${LAYAD_DEVICE:-cpu}" \
+  --device "$DEVICE" \
+  --backend "$BACKEND" \
   --log info >"$LOG" 2>&1 &
 DAEMON_PID=$!
 

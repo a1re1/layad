@@ -3,7 +3,8 @@
 A local HTTP daemon that keeps **one** Python Laya decision model resident, so
 repeated predictions do not pay model load cost. Rust owns the HTTP surface and
 the worker process lifecycle; a persistent Python child owns the model and
-reuses upstream `laya` inference code unchanged.
+drives the Laya checkpoint through the same `predict` call either backend
+exposes.
 
 This is a small, local, single-user tool. It is *Jev-compatible at the wire
 level*: it serves Jev's `POST /v1/systemone` and `GET /v1/models` paths, accepts
@@ -31,12 +32,16 @@ daemon tears the worker down and shuts down so `launchd` can restart it cleanly.
 
 ## Requirements
 
-* macOS (Linux mostly works; launchd integration is macOS-only)
+* macOS on Apple silicon (the default MLX backend is Apple-only; launchd
+  integration is macOS-only too)
 * `uv` — <https://docs.astral.sh/uv/> (`brew install uv`)
 * Rust toolchain with cargo — <https://rustup.rs>
-* ~10 GB free disk for the first setup (PyTorch wheels plus checkpoint), and
-  enough RAM for the chosen checkpoint (CPU-only inference on the English
-  checkpoint works in a few GB).
+* ~2 GB free disk for the first setup (the compiled MLX wheels plus the
+  ~850 MB checkpoint), and enough RAM for the chosen checkpoint (a few GB).
+
+Inference defaults to **native MLX** (`laya-mlx`) on the Apple GPU. `--backend
+mlx` is the default; `--backend torch` selects upstream `laya` on
+PyTorch/transformers instead, which is what a non-Apple host needs.
 
 ## Setup
 
@@ -64,8 +69,9 @@ Selection is by environment variable:
 | Variable | Values | Default |
 | --- | --- | --- |
 | `LAYAD_CHECKPOINT` | `english`, `multilingual`, `typed-decisions` | `english` |
-| `LAYAD_DEVICE` | `cpu`, `mps`, `cuda`, `auto` | `cpu` |
-| `LAYAD_MODEL_REPO` | any HF repo id | `convaiinnovations/laya` |
+| `LAYAD_BACKEND` | `mlx`, `torch` | `mlx` |
+| `LAYAD_DEVICE` | `auto`, `cpu`, `gpu`, `mps`, `cuda` | `auto` |
+| `LAYAD_MODEL_REPO` | any HF repo id | `aac6fef/laya-mlx` |
 | `LAYAD_RECOMPILE=1` | recompile `requirements.txt` from `.in` | off |
 | `LAYAD_SKIP_DOWNLOAD=1` | reuse `.layad/model` | off |
 | `LAYAD_SKIP_WARM=1` | skip the warmup run | off |
@@ -97,11 +103,19 @@ the cache the setup warmed.
 
 ### Devices
 
-`cpu` is the default and the only device that is guaranteed to work. `mps`
-is Apple Metal, `cuda` is NVIDIA, `auto` prefers CUDA, then MPS, then CPU.
-**Explicitly requesting an unavailable device can fall back to CPU.** The
-daemon always reports both the requested and the actual device (`/readyz`,
-startup logs), so trust the reported one.
+Devices are per-backend. Under `--backend mlx` (the default) `auto` prefers the
+Apple GPU and falls back to CPU, and `cpu`/`gpu` pin one or the other; `cuda`,
+`mps` and the `torch` spelling are PyTorch concepts and only mean something
+under `--backend torch`, where `auto` prefers CUDA, then MPS, then CPU.
+**Explicitly requesting an unavailable device can fall back.** The daemon
+always reports the requested and the actual device *and* the backend
+(`/readyz`, startup logs), so trust the reported ones. Note that
+PyTorch-on-MPS currently aborts on this checkpoint's graph shapes — MLX is the
+backend that actually gets Apple silicon onto the GPU.
+
+A mismatched pair is refused at startup instead of failing later inside the
+worker: `--backend mlx` accepts `auto`, `cpu` and `gpu`, while `--backend torch`
+accepts `auto`, `cpu`, `cuda` and `mps`.
 
 ### Offline startup
 
@@ -121,12 +135,14 @@ Foreground, which is all you need on any platform:
   --python ./.venv/bin/python \
   --model ./.layad/model \
   --checkpoint english \
-  --device cpu
+  --backend mlx \
+  --device auto
 ```
 
-Useful flags: `--checkpoint english|multilingual|typed-decisions` (selects the
-checkpoint subfolder inside `--model`; the daemon fails closed when that
-subfolder is missing), `--startup-timeout-ms`,
+Useful flags: `--backend mlx|torch` (the inference stack), `--checkpoint
+english|multilingual|typed-decisions` (selects the checkpoint subfolder inside
+`--model`; the daemon fails closed when that subfolder is missing),
+`--startup-timeout-ms`,
 `--inference-timeout-ms`, `--max-concurrent`, `--max-questions`,
 `--max-body-bytes`, `--log`, `--no-fail-fast`. Every flag also reads an
 environment variable (`LAYAD_*`); see `layad --help`.
@@ -154,9 +170,10 @@ When ready:
   "ready": true,
   "model": ".layad/model",
   "checkpoint": "english",
-  "device": "cpu",
-  "requested_device": "cpu",
-  "laya_version": "0.3.4",
+  "backend": "mlx",
+  "device": "gpu",
+  "requested_device": "auto",
+  "laya_version": "0.2.0",
   "worker_pid": 4321,
   "worker_identity": "4321:...",
   "warmup": ["choice", "score", "noul"]
@@ -400,13 +417,15 @@ directory, so they never touch the real launchd.
 
 ## Logs and troubleshooting
 
-* `.layad/warmup.log` — output of the setup warmup run.
+* `.layad/warmup.log` — output of the setup warmup run, including the
+  backend and the device the worker actually loaded.
 * `.layad/layad.log`, `.layad/layad.err.log` — service stdout/stderr.
 * `/readyz` says `"reason":"loading"` for a long time → first load is slow,
   especially on CPU; check `--startup-timeout-ms` and the worker log.
 * Daemon exits shortly after start with the worker failing → run the worker
   directly to see the real error:
-  `./.venv/bin/python python/worker.py --model .layad/model --device cpu --help`.
+  `./.venv/bin/python python/worker.py --model .layad/model --backend mlx
+  --device auto --help`.
 * Setup failed mid-download → rerun it; the HF cache resumes.
 
 ## Development
@@ -422,7 +441,7 @@ bash tests/scripts_offline_test.sh
 ```
 
 The Rust integration tests and the Python worker tests use a fake child
-process, so they need no torch and no checkpoint. `tests/service_test.sh`
+process, so they need no MLX, no torch and no checkpoint. `tests/service_test.sh`
 stubs `launchctl` and points `HOME` at a temporary directory, so it never
 registers a real login service. `tests/scripts_offline_test.sh` covers the
 setup/smoke argument rendering, missing-checkpoint failure, the locked build
@@ -439,6 +458,16 @@ and a stub `launchctl`.
   restarting the process, not by hot-swapping models in place.
 * Upstream Laya behavior (prompt format, sampling, calibration) is inherited
   as-is; this project does not tune or validate it.
+* The MLX checkpoint ships tokenizer temperatures outside laya-mlx's accepted
+  `[0.5, 5]` window, so `laya_mlx` clamps the affected choice buckets (it
+  prints a `RuntimeWarning` naming the bucket, e.g. `choice:11+=0.1006`, at
+  import). Confidence from a bucket named in that warning is uncalibrated;
+  recompute a threshold from `probabilities` or use `--backend torch` if that
+  matters. Argmax decisions are unaffected.
+* Rough throughput on an M4 Pro (measured, GPU): 100 repeated three-question
+  calls took 2.7 s — about 27 ms per call, against roughly 90 to 120 ms per
+  comparable call on PyTorch CPU. One 13-question planning request therefore
+  costs a few hundred ms; the request *count* a client sends dominates.
 * Jev compatibility covers the wire contract only: `POST /v1/systemone` and
   `GET /v1/models` accept Jev request bodies and answer with Jev's response
   shape. `POST /v1/predict`, `/readyz` and `/healthz` are layad's own; values
@@ -453,6 +482,9 @@ rm -rf .venv .layad target     # removes env, model/caches/logs and binaries
 
 ## Model and license
 
-Weights come from the upstream [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)
-repository and the Python `laya==0.3.4` package; their licenses and terms apply
+Weights come by default from the MLX port
+[`aac6fef/laya-mlx`](https://huggingface.co/aac6fef/laya-mlx) and the Python
+`laya-mlx==0.2.0` package; with `--backend torch` they come from the upstream
+[`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)
+repository and the Python `laya==0.3.4` package. Those licenses and terms apply
 to the model. This repository is MIT-licensed (see `LICENSE`).
