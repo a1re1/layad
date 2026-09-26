@@ -1,9 +1,10 @@
 """Bridge tests for python/worker.py.
 
-These use a stub ``laya`` module, so they need no model download and no torch.
-They cover the parts of the protocol the daemon relies on: readiness after a
-warmup, request ids, request-scoped validation errors, fatal handling of
-malformed frames, and the stdout isolation that keeps protocol frames clean.
+These stub the inference stacks (``laya_mlx``/``laya``), so they need no model
+download and no MLX or torch. They cover the parts of the protocol the daemon
+relies on: readiness after a warmup, request ids, request-scoped validation
+errors, fatal handling of malformed frames, the reported device for both
+stacks, and the stdout isolation that keeps protocol frames clean.
 """
 
 import io
@@ -311,47 +312,130 @@ class ProtocolIsolationTests(unittest.TestCase):
 
 
 class DeviceSelectionTests(unittest.TestCase):
-    """The worker's --device handling, with laya stubbed out (no torch)."""
+    """The worker's --backend/--device handling, stacks stubbed out."""
 
-    def test_auto_translates_to_no_device_argument(self):
-        worker = load_worker_module()
-        calls = []
+    @staticmethod
+    def stub(calls):
+        class Stub:
+            def __init__(self, name):
+                self.__name__ = name
+                self.__version__ = "stub"
 
-        class StubLaya:
             def load(self, model, **kwargs):
-                calls.append((model, kwargs))
+                calls.append((self.__name__, model, kwargs))
                 return FakeAgent()
 
-        args = worker.parse_args(["--model", "some/repo", "--device", "auto"])
-        stream = io.StringIO()
-        with mock.patch.dict(sys.modules, {"laya": StubLaya()}):
-            instance = worker.Worker(stream, args)
-            instance.load()
+        return {"laya_mlx": Stub("laya_mlx"), "laya": Stub("laya")}
 
+    def test_mlx_is_the_default_backend(self):
+        worker = load_worker_module()
+        calls = []
+        args = worker.parse_args(["--model", "some/repo"])
+        with mock.patch.dict(sys.modules, self.stub(calls)):
+            worker.Worker(io.StringIO(), args).load()
+
+        self.assertEqual(args.backend, "mlx")
+        self.assertEqual(args.device, "auto")
         self.assertEqual(len(calls), 1)
-        model, kwargs = calls[0]
+        name, model, kwargs = calls[0]
+        self.assertEqual(name, "laya_mlx")
         self.assertEqual(model, "some/repo")
-        # None means "let upstream choose"; the string "auto" must never reach it.
+        # Neither stack accepts the string "auto": MLX validates its device
+        # against gpu/metal/cpu and upstream laya against torch's devices, so
+        # "let the library choose" is spelled None for both.
         self.assertIsNone(kwargs["device"])
         self.assertIsNone(kwargs["subfolder"])
+
+    def test_torch_backend_translates_auto_and_passes_the_rest_through(self):
+        worker = load_worker_module()
+        calls = []
+        args = worker.parse_args(
+            [
+                "--backend",
+                "torch",
+                "--model",
+                ".layad/model",
+                "--device",
+                "auto",
+                "--subfolder",
+                "multilingual",
+            ]
+        )
+        with mock.patch.dict(sys.modules, self.stub(calls)):
+            worker.Worker(io.StringIO(), args).load()
+
+        name, _, kwargs = calls[0]
+        self.assertEqual(name, "laya")
+        # PyTorch spells it None; the string "auto" must never reach it.
+        self.assertIsNone(kwargs["device"])
+        self.assertEqual(kwargs["subfolder"], "multilingual")
 
     def test_explicit_device_and_subfolder_are_passed_through(self):
         worker = load_worker_module()
         calls = []
-
-        class StubLaya:
-            def load(self, model, **kwargs):
-                calls.append(kwargs)
-                return FakeAgent()
-
         args = worker.parse_args(
-            ["--model", ".layad/model", "--device", "cpu", "--subfolder", "multilingual"]
+            ["--model", ".layad/model", "--device", "gpu", "--subfolder", "multilingual"]
         )
-        with mock.patch.dict(sys.modules, {"laya": StubLaya()}):
+        with mock.patch.dict(sys.modules, self.stub(calls)):
             worker.Worker(io.StringIO(), args).load()
 
-        self.assertEqual(calls[0]["device"], "cpu")
-        self.assertEqual(calls[0]["subfolder"], "multilingual")
+        self.assertEqual(calls[0][2]["device"], "gpu")
+        self.assertEqual(calls[0][2]["subfolder"], "multilingual")
+
+    def test_unknown_backend_is_refused(self):
+        worker = load_worker_module()
+        with self.assertRaises(SystemExit):
+            worker.parse_args(["--backend", "metal"])
+
+
+class DeviceLabelTests(unittest.TestCase):
+    """The reported device must be a plain name for both inference stacks."""
+
+    class TorchDevice:
+        type = "cpu"
+
+    class MlxDeviceType:
+        def __str__(self):
+            return "DeviceType.gpu"
+
+    class MlxDevice:
+        """What a real laya_mlx agent carries: type enum plus a repr."""
+
+        def __init__(self):
+            # Resolved at call time, when DeviceLabelTests exists in the module.
+            self.type = DeviceLabelTests.MlxDeviceType()
+
+        def __str__(self):
+            return "Device(gpu, 0)"
+
+    class MlxDeviceWithoutType:
+        def __str__(self):
+            return "Device(cpu, 0)"
+
+    def test_torch_device_type_is_used_as_is(self):
+        worker = load_worker_module()
+        agent = type("Agent", (), {"device": self.TorchDevice()})()
+        self.assertEqual(worker.device_label(agent), "cpu")
+
+    def test_mlx_enum_device_type_is_reduced_to_its_name(self):
+        worker = load_worker_module()
+        agent = type("Agent", (), {"device": self.MlxDeviceType()})()
+        self.assertEqual(worker.device_label(agent), "gpu")
+
+    def test_mlx_device_repr_is_reduced_to_its_name(self):
+        worker = load_worker_module()
+        agent = type("Agent", (), {"device": self.MlxDevice()})()
+        # The enum attribute wins; the repr is never returned raw.
+        self.assertEqual(worker.device_label(agent), "gpu")
+
+    def test_mlx_device_without_a_type_falls_back_to_the_repr(self):
+        worker = load_worker_module()
+        agent = type("Agent", (), {"device": self.MlxDeviceWithoutType()})()
+        self.assertEqual(worker.device_label(agent), "cpu")
+
+    def test_a_missing_device_is_unknown(self):
+        worker = load_worker_module()
+        self.assertEqual(worker.device_label(object()), "unknown")
 
 
 if __name__ == "__main__":

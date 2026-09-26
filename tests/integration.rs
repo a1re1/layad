@@ -232,7 +232,14 @@ async fn healthz_is_up_and_readyz_reports_the_resident_model() {
     let (status, ready) = send(&state, "/readyz", None).await;
     assert_eq!(status, StatusCode::OK, "{ready}");
     assert_eq!(ready["ready"], true);
-    assert_eq!(ready["device"], "cpu");
+    // The default backend (MLX) is asked to choose its own device, so the
+    // device that is reported is the one MLX picked.
+    assert_eq!(ready["requested_device"], "auto");
+    assert!(
+        ["gpu", "cpu"].contains(&ready["device"].as_str().unwrap_or_default()),
+        "unexpected device: {ready}"
+    );
+    assert_eq!(ready["backend"], "mlx");
     assert!(ready["worker_pid"].as_u64().unwrap_or_default() > 0);
 }
 
@@ -577,6 +584,7 @@ async fn two_predictions_keep_one_worker_identity() {
     let (_, first) = send(&state, "/readyz", None).await;
     let identity_before = first["worker_identity"].clone();
     let pid_before = first["worker_pid"].clone();
+    let first_device = first["device"].clone();
     assert!(identity_before.is_string(), "{first}");
 
     for name in ["first", "second"] {
@@ -587,7 +595,7 @@ async fn two_predictions_keep_one_worker_identity() {
     let (_, second) = send(&state, "/readyz", None).await;
     assert_eq!(second["worker_identity"], identity_before);
     assert_eq!(second["worker_pid"], pid_before);
-    assert_eq!(second["device"], "cpu");
+    assert_eq!(second["device"], first_device);
 }
 
 /// A canceled caller must not leave a late reply to be mixed into the next
@@ -1173,11 +1181,46 @@ async fn checkpoint_selection_reaches_the_worker() {
     );
     let info = worker.info().await.expect("worker metadata");
     assert_eq!(info.checkpoint, "typed-decisions");
+    assert_eq!(info.backend, "mlx", "the default backend must be reported");
+    assert_eq!(body["backend"], "mlx");
     let env = read_env_file(&env_file).await;
     assert_eq!(
         env.get("LAYAD_CHECKPOINT").map(String::as_str),
         Some("typed-decisions"),
         "the selected checkpoint must reach the worker: {env:?}"
+    );
+    assert_eq!(
+        env.get("LAYAD_BACKEND").map(String::as_str),
+        Some("mlx"),
+        "the default backend must reach the worker: {env:?}"
+    );
+    worker.shutdown(Duration::from_secs(5)).await;
+
+    // `torch` stays selectable for a host without MLX, and must be what the
+    // worker is actually asked for — not just what the daemon reports.
+    let torch_env_file = dir.path().join("torch.env");
+    let (state, worker) = ready_app(fake_config(&[
+        "--backend",
+        "torch",
+        "--device",
+        "cpu",
+        "--worker-arg",
+        "--env-file",
+        "--worker-arg",
+        torch_env_file.to_str().expect("utf-8 path"),
+    ]))
+    .await;
+    let (status, body) = send(&state, "/readyz", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["backend"], "torch");
+    let info = worker.info().await.expect("worker metadata");
+    assert_eq!(info.backend, "torch");
+    assert_eq!(
+        read_env_file(&torch_env_file)
+            .await
+            .get("LAYAD_BACKEND")
+            .map(String::as_str),
+        Some("torch")
     );
     worker.shutdown(Duration::from_secs(5)).await;
 
@@ -1594,15 +1637,9 @@ async fn classifier_shaped_skill_questions_are_accepted_on_both_routes() {
     // Jev's projection drops the `action` block upstream Laya adds; layad's own
     // route passes it through, so the same body answers on both.
     let (_, jev) = send_raw(&state, "/v1/systemone", &body).await;
-    assert!(
-        jev["answers"]["skill_0"].get("action").is_none(),
-        "{jev}"
-    );
+    assert!(jev["answers"]["skill_0"].get("action").is_none(), "{jev}");
     let (_, own) = send_raw(&state, "/v1/predict", &body).await;
-    assert!(
-        own["answers"]["skill_0"].get("action").is_some(),
-        "{own}"
-    );
+    assert!(own["answers"]["skill_0"].get("action").is_some(), "{own}");
 }
 
 /// One candidate per named question: a pool of this size must fit in the
@@ -1669,12 +1706,21 @@ async fn a_skill_pool_fanout_is_admitted_not_refused() {
     for index in 0..24 {
         let state = state.clone();
         handles.push(tokio::spawn(async move {
-            send(&state, "/v1/predict", Some(prediction(&format!("burst {index}")))).await
+            send(
+                &state,
+                "/v1/predict",
+                Some(prediction(&format!("burst {index}"))),
+            )
+            .await
         }));
     }
 
     for handle in handles {
         let (status, value) = handle.await.expect("fan-out task joins");
-        assert_eq!(status, StatusCode::OK, "fan-out request was refused: {value}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "fan-out request was refused: {value}"
+        );
     }
 }

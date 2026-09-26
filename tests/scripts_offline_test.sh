@@ -104,6 +104,23 @@ esac
 LAYAD_DEVICE=mpsc bash "$REPO/scripts/setup.sh" >/dev/null 2>&1 && mpsc_status=0 || mpsc_status=$?
 check "setup rejects the mpsc device typo" "$mpsc_status" 1
 
+# --------------------------------------------------------- backend selection
+: >"$PY_ARGS"
+backend_out="$(LAYAD_CHECKPOINT=english LAYAD_DEVICE=gpu bash "$REPO/scripts/setup.sh" 2>&1)" || true
+case "$(cat "$PY_ARGS")" in
+  *"--backend mlx"*) check "warmup asks for the MLX backend by default" ok ok ;;
+  *) check "warmup asks for the MLX backend by default" bad ok ;;
+esac
+case "$backend_out" in
+  *"--backend mlx"*) check "setup prints the foreground command with the backend" ok ok ;;
+  *) check "setup prints the foreground command with the backend" bad ok ;;
+esac
+
+: >"$PY_ARGS"
+LAYAD_BACKEND=metal bash "$REPO/scripts/setup.sh" >/dev/null 2>&1 && bad_backend=0 || bad_backend=$?
+check "setup rejects an unknown backend" "$bad_backend" 1
+check "no worker was run for a refused backend" "$(wc -l <"$PY_ARGS" | tr -d ' ')" 0
+
 : >"$PY_ARGS"
 missing_out="$(LAYAD_CHECKPOINT=typed-decisions bash "$REPO/scripts/setup.sh" 2>&1)" || true
 case "$missing_out" in
@@ -143,6 +160,7 @@ smoke_fail() { # label, env-assignments..., expect-substring
 }
 
 smoke_fail "smoke rejects an unknown checkpoint" "LAYAD_CHECKPOINT=bogus" "LAYAD_CHECKPOINT must be"
+smoke_fail "smoke rejects an unknown backend" "LAYAD_BACKEND=metal" "LAYAD_BACKEND must be"
 smoke_fail "smoke fails when the selected subfolder is missing" "LAYAD_CHECKPOINT=typed-decisions" "is missing from"
 
 # A listener that answers 200 on every path must make the run refuse to start:

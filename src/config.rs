@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 
-/// Default Hugging Face repository bundling the Laya checkpoints.
-pub const DEFAULT_MODEL: &str = "convaiinnovations/laya";
+/// Default Hugging Face repository: the native Apple MLX port of the Laya
+/// checkpoint (`laya-mlx`). Upstream `convaiinnovations/laya` is still a valid
+/// `--model`, but only the `torch` backend can load it.
+pub const DEFAULT_MODEL: &str = "aac6fef/laya-mlx";
 
 /// Which checkpoint inside the model repository to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -59,13 +61,16 @@ impl std::fmt::Display for Checkpoint {
 /// Device requested for the resident model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Device {
-    /// Reliable default everywhere.
+    /// CPU inference (reliable everywhere, slowest).
     Cpu,
-    /// Apple silicon GPU.
+    /// Apple silicon GPU under the MLX backend (`--backend mlx`).
+    Gpu,
+    /// Apple Metal under PyTorch (`--backend torch`); PyTorch/mps aborts on
+    /// this checkpoint's graph shapes, so MLX is what actually reaches the GPU.
     Mps,
     /// NVIDIA GPU (CUDA build of PyTorch required).
     Cuda,
-    /// Let Laya pick: CUDA, then MPS, then CPU.
+    /// Let the backend pick (MLX: GPU then CPU; PyTorch: CUDA, then MPS, CPU).
     Auto,
 }
 
@@ -73,6 +78,7 @@ impl Device {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
             Self::Mps => "mps",
             Self::Cuda => "cuda",
             Self::Auto => "auto",
@@ -81,6 +87,30 @@ impl Device {
 }
 
 impl std::fmt::Display for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Inference backend for the resident model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Backend {
+    /// Native Apple MLX via `laya-mlx`. The default; Apple silicon only.
+    Mlx,
+    /// Upstream `laya` on PyTorch/transformers, for hosts without MLX.
+    Torch,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mlx => "mlx",
+            Self::Torch => "torch",
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -152,8 +182,13 @@ pub struct Cli {
     #[arg(long, value_enum, env = "LAYAD_CHECKPOINT", default_value_t = Checkpoint::English)]
     pub checkpoint: Checkpoint,
 
+    /// Inference backend for the resident model: `mlx` (native Apple MLX,
+    /// the default) or `torch` (upstream laya on PyTorch).
+    #[arg(long, value_enum, env = "LAYAD_BACKEND", default_value_t = Backend::Mlx)]
+    pub backend: Backend,
+
     /// Device for the resident model (actual device is reported by /readyz).
-    #[arg(long, value_enum, env = "LAYAD_DEVICE", default_value_t = Device::Cpu)]
+    #[arg(long, value_enum, env = "LAYAD_DEVICE", default_value_t = Device::Auto)]
     pub device: Device,
 
     /// Environment variable for the worker, `KEY=VALUE` (repeatable).
@@ -220,6 +255,7 @@ pub struct Config {
     pub worker_args: Vec<String>,
     pub model: String,
     pub checkpoint: Checkpoint,
+    pub backend: Backend,
     pub device: Device,
     pub python_env: Vec<(String, String)>,
     pub max_body_bytes: usize,
@@ -262,6 +298,25 @@ impl Config {
         if self.python.as_os_str().is_empty() {
             return Err("--python must not be empty".to_string());
         }
+        // A device name only means something under its own backend. Refusing the
+        // pair here turns a typo into a startup error instead of a worker that
+        // dies inside the inference stack after the model was downloaded.
+        match (self.backend, self.device) {
+            (Backend::Mlx, Device::Mps) | (Backend::Mlx, Device::Cuda) => {
+                return Err(format!(
+                    "--device {} is a PyTorch device and only works with --backend torch",
+                    self.device
+                ));
+            }
+            (Backend::Torch, Device::Gpu) => {
+                return Err(
+                    "--device gpu is the MLX device name and only works with --backend mlx \
+                     (use --device cuda or --device mps for PyTorch)"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -290,6 +345,8 @@ impl Config {
         args.push(self.model.clone());
         args.push("--device".to_string());
         args.push(self.device.as_str().to_string());
+        args.push("--backend".to_string());
+        args.push(self.backend.as_str().to_string());
         if let Some(subfolder) = self.subfolder() {
             args.push("--subfolder".to_string());
             args.push(subfolder);
@@ -321,6 +378,7 @@ impl TryFrom<Cli> for Config {
             worker_args: cli.worker_args,
             model: cli.model,
             checkpoint: cli.checkpoint,
+            backend: cli.backend,
             device: cli.device,
             python_env,
             max_body_bytes: cli.max_body_bytes,
@@ -349,13 +407,22 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_loopback_cpu_english() {
+    fn defaults_are_loopback_mlx_english() {
         let config = Config::try_from(cli(&[])).expect("defaults valid");
         assert_eq!(config.bind.ip().to_string(), "127.0.0.1");
         assert_eq!(config.checkpoint, Checkpoint::English);
         assert_eq!(config.checkpoint.subfolder(), None);
-        assert_eq!(config.device, Device::Cpu);
+        // Apple MLX is the default backend and picks the GPU itself.
+        assert_eq!(config.backend, Backend::Mlx);
+        assert_eq!(config.device, Device::Auto);
+        assert_eq!(DEFAULT_MODEL, "aac6fef/laya-mlx");
         assert!(config.fail_fast);
+        let (_, args) = config.worker_command();
+        let idx = args
+            .iter()
+            .position(|a| a == "--backend")
+            .expect("backend flag");
+        assert_eq!(args[idx + 1], "mlx");
         // A classifier pool (one question per candidate, one request per
         // authored skill) must fit the defaults without raising flags.
         assert!(config.max_questions >= 64, "{}", config.max_questions);
@@ -393,6 +460,52 @@ mod tests {
             .position(|a| a == "--subfolder")
             .expect("subfolder flag");
         assert_eq!(args[idx + 1], "multilingual");
+    }
+
+    #[test]
+    fn torch_backend_is_selectable() {
+        let config = Config::try_from(cli(&[
+            "--backend",
+            "torch",
+            "--device",
+            "cuda",
+            "--model",
+            "convaiinnovations/laya",
+        ]))
+        .unwrap();
+        assert_eq!(config.backend, Backend::Torch);
+        assert_eq!(config.device.as_str(), "cuda");
+        let (_, args) = config.worker_command();
+        let idx = args
+            .iter()
+            .position(|a| a == "--backend")
+            .expect("backend flag");
+        assert_eq!(args[idx + 1], "torch");
+    }
+
+    #[test]
+    fn mismatched_backend_and_device_are_rejected() {
+        // `mps`/`cuda` are torch devices and `gpu` is MLX's; each pair is refused
+        // at startup rather than at model load.
+        for args in [
+            vec!["--backend", "mlx", "--device", "cuda"],
+            vec!["--backend", "mlx", "--device", "mps"],
+            vec!["--backend", "torch", "--device", "gpu"],
+        ] {
+            let err = Config::try_from(cli(&args)).unwrap_err();
+            assert!(err.contains("--device") && err.contains("backend"), "{args:?}: {err}");
+        }
+        // The per-backend device sets themselves stay accepted.
+        for args in [
+            vec!["--backend", "mlx", "--device", "gpu"],
+            vec!["--backend", "mlx", "--device", "cpu"],
+            vec!["--backend", "mlx", "--device", "auto"],
+            vec!["--backend", "torch", "--device", "cuda"],
+            vec!["--backend", "torch", "--device", "mps"],
+            vec!["--backend", "torch", "--device", "auto"],
+        ] {
+            Config::try_from(cli(&args)).expect("valid backend/device pairing");
+        }
     }
 
     #[test]

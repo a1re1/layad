@@ -4,13 +4,18 @@
 # `uv pip compile` for Python 3.11 and installs the result into .venv, so the
 # worker runs against exactly the versions this project was tested with.
 #
-# Pins are deliberate: upstream laya 0.3.4 requires torch>=2.0, transformers>=4.45
-# and huggingface_hub>=0.20, and an uncontrolled transformers major can break
-# checkpoint loading (see the tokenizer_config workarounds in laya/agent.py).
+# Pins are deliberate: `laya-mlx` is the native Apple MLX port of the Laya
+# checkpoint and carries `mlx` itself, so there is no torch, transformers or
+# tokenizer pin left to hold down. The Apple-only build is intentional: the
+# compiled MLX wheels are macOS/arm64.
+#
+# `laya-mlx` needs huggingface_hub for snapshot resolution and tokenizers for
+# the tokenizer, both of which it declares; the pins below only fix the
+# versions this project was tested with.
 
-laya==0.3.4
-torch==2.6.0
-transformers==4.49.0
-huggingface_hub==0.28.1
-safetensors==0.5.2
-numpy==2.0.2
+laya-mlx==0.2.0
+mlx==0.32.2
+huggingface_hub==1.33.0
+safetensors==0.8.0
+tokenizers==0.23.2
+numpy==2.4.6
