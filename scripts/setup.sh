@@ -18,6 +18,9 @@
 #   LAYAD_RECOMPILE=1    recompile python/requirements.txt from the .in file
 #   LAYAD_SKIP_DOWNLOAD=1  skip the checkpoint download (already present)
 #   LAYAD_SKIP_WARM=1    skip the warmup/verification run
+#   MACOSX_DEPLOYMENT_TARGET=14.0  (Darwin) macOS release whose wheels the
+#                                  recompile resolves; uv otherwise assumes a
+#                                  macOS older than 14, where MLX ships nothing
 #
 # Layout (the same paths the foreground daemon and scripts/service.sh use):
 #   .layad/model   checkpoint files; non-English checkpoints are subfolders
@@ -36,8 +39,12 @@ VENV="$ROOT/.venv"
 LAYAD_HOME="$ROOT/.layad"
 MODEL_DIR="$LAYAD_HOME/model"
 HF_HOME="$LAYAD_HOME/hf"
-REQUIREMENTS_IN="$ROOT/python/requirements.in"
 REQUIREMENTS="$ROOT/python/requirements.txt"
+# The compile step below passes these repo-relative forms: uv records the
+# command line it was given as a header in the generated file, so absolute
+# paths would put one machine's checkout path into a committed file.
+REQUIREMENTS_IN_REL="python/requirements.in"
+REQUIREMENTS_REL="python/requirements.txt"
 WORKER="$ROOT/python/worker.py"
 
 log() { printf '[setup] %s\n' "$*" >&2; }
@@ -87,7 +94,20 @@ actual_version="$("$VENV_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2
 # --------------------------------------------------------- pinned dependencies
 if [[ -n "${LAYAD_RECOMPILE:-}" || ! -f "$REQUIREMENTS" ]]; then
   log "compiling pinned requirements for Python $PY_VERSION (the MLX wheels are small)"
-  compile_args=(--python-version "$PY_VERSION" --generate-hashes --output-file "$REQUIREMENTS")
+  # `uv pip compile` picks acceptable wheel tags from MACOSX_DEPLOYMENT_TARGET
+  # and, when it is unset, assumes an old macOS. The pinned mlx==0.32.2 ships
+  # macOS arm64 wheels only for 14.0 and later, so a compile without this fails
+  # on a current Mac with "no wheels with a matching platform tag". Default to
+  # the oldest macOS MLX supports; the operator can ask for a newer one.
+  #
+  # The target is scoped to the compile command (passed through `env`, not
+  # exported) so it cannot leak into the later `uv pip install` or the release
+  # build, which would otherwise target the same old macOS.
+  compile_env=()
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    compile_env+=("MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-14.0}")
+  fi
+  compile_args=(--python-version "$PY_VERSION" --generate-hashes --output-file "$REQUIREMENTS_REL")
   # uv only accepts its own target-triple names. sysconfig reports a platform
   # string such as "macosx-14.0-arm64", which uv rejects; map the host to a
   # supported triple, and for an unknown host pass nothing so uv uses its own
@@ -99,7 +119,7 @@ if [[ -n "${LAYAD_RECOMPILE:-}" || ! -f "$REQUIREMENTS" ]]; then
     Linux/aarch64 | Linux/arm64) compile_args+=(--python-platform aarch64-unknown-linux-gnu) ;;
     *) log "note: unknown host $(uname -s)/$(uname -m); using uv's native platform" ;;
   esac
-  uv pip compile "$REQUIREMENTS_IN" "${compile_args[@]}" ||
+  env "${compile_env[@]}" uv pip compile "$REQUIREMENTS_IN_REL" "${compile_args[@]}" ||
     die "uv pip compile failed; re-run with network access or pin python/requirements.txt manually"
 else
   log "reusing pinned python/requirements.txt (LAYAD_RECOMPILE=1 recompiles)"
