@@ -75,6 +75,12 @@ Selection is by environment variable:
 | `LAYAD_RECOMPILE=1` | recompile `requirements.txt` from `.in` | off |
 | `LAYAD_SKIP_DOWNLOAD=1` | reuse `.layad/model` | off |
 | `LAYAD_SKIP_WARM=1` | skip the warmup run | off |
+| `MACOSX_DEPLOYMENT_TARGET` | macOS release whose wheels a recompile resolves (Darwin) | `14.0` |
+
+`LAYAD_RECOMPILE=1` resolves wheels for `MACOSX_DEPLOYMENT_TARGET`, which
+defaults to `14.0` on macOS: the oldest macOS the pinned MLX wheels are built
+for. Raise it to resolve wheels for a newer macOS, or lower it only if you are
+not using the MLX backend.
 
 The English checkpoint lives at the repository root; `multilingual` and
 `typed-decisions` live in subfolders and are fetched as subfolders. Only the
