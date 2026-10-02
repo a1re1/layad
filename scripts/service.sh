@@ -17,6 +17,10 @@
 #   LAYAD_BIND    bind address             (default 127.0.0.1:8787)
 #   LAYAD_BACKEND mlx|torch               (default mlx)
 #   LAYAD_DEVICE  auto|cpu|gpu|mps|cuda    (default auto)
+#   LAYAD_MEMORY_MB  memory ceiling in MiB for the resident worker (default
+#                    2048; 0 disables layad's cap). The plist pins an explicit
+#                    value, so a changed default only takes effect after the
+#                    service is reinstalled.
 #   LAYAD_CHECKPOINT english|multilingual|typed-decisions (default english;
 #                    a non-English checkpoint selects that model subfolder)
 #   LAYAD_LOG     tracing filter           (default info)
@@ -36,6 +40,7 @@ BACKEND="${LAYAD_BACKEND:-mlx}"
 DEVICE="${LAYAD_DEVICE:-auto}"
 CHECKPOINT="${LAYAD_CHECKPOINT:-english}"
 LOG_FILTER="${LAYAD_LOG:-info}"
+MEMORY_MB="${LAYAD_MEMORY_MB:-2048}"
 LAYAD_HOME_DIR="${LAYAD_HOME_DIR:-$ROOT/.layad}"
 LAUNCHCTL="${LAYAD_LAUNCHCTL:-launchctl}"
 PLIST_DIR="${LAYAD_PLIST_DIR:-$HOME/Library/LaunchAgents}"
@@ -76,6 +81,9 @@ esac
 case "$BACKEND" in
   mlx | torch) ;;
   *) die "LAYAD_BACKEND must be mlx or torch (got '$BACKEND')" ;;
+esac
+case "$MEMORY_MB" in
+  '' | *[!0-9]*) die "LAYAD_MEMORY_MB must be a whole number of MiB (got '$MEMORY_MB')" ;;
 esac
 case "$DEVICE" in
   auto | cpu | gpu | mps | cuda) ;;
@@ -131,6 +139,9 @@ render_plist() {
   printf '%s\n' '  </array>'
   printf '%s\n' '  <key>EnvironmentVariables</key>' '  <dict>'
   printf '    <key>HF_HOME</key>\n    <string>%s</string>\n' "$(xml_escape "$HF_HOME_DIR")"
+  # The daemon caps the resident worker's memory; launchd pins the value so a
+  # restart always comes back with the same ceiling.
+  printf '    <key>LAYAD_MEMORY_MB</key>\n    <string>%s</string>\n' "$(xml_escape "$MEMORY_MB")"
   printf '    <key>HF_HUB_OFFLINE</key>\n    <string>1</string>\n'
   printf '    <key>TRANSFORMERS_OFFLINE</key>\n    <string>1</string>\n'
   printf '%s\n' '  </dict>'

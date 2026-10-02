@@ -168,6 +168,7 @@ def main(argv):
         # internals.
         keys = [
             "HF_HOME",
+            "LAYAD_MEMORY_MB",
             "LAYAD_MODEL",
             "LAYAD_BACKEND",
             "LAYAD_DEVICE",

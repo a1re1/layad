@@ -207,6 +207,13 @@ case "$default_plist" in
     check "the plist lets the backend choose the device" ok ok ;;
   *) check "the plist lets the backend choose the device" bad ok ;;
 esac
+# The memory ceiling has to survive the launchd restart loop: the daemon reads
+# it from its own environment, so the plist has to carry it.
+case "$default_plist" in
+  *"<key>LAYAD_MEMORY_MB</key>"*"<string>2048</string>"*)
+    check "the plist passes the memory ceiling to the worker" ok ok ;;
+  *) check "the plist passes the memory ceiling to the worker" bad ok ;;
+esac
 if LAYAD_BACKEND=bogus bash "$SERVICE" plist >/dev/null 2>&1; then
   check "an unknown backend is refused" bad ok
 else

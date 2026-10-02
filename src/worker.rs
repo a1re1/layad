@@ -1062,6 +1062,13 @@ fn worker_env(config: &Config) -> HashMap<String, String> {
         "LAYAD_CHECKPOINT".to_string(),
         config.checkpoint.as_str().to_string(),
     );
+    // The worker's memory cap travels as an environment variable on purpose:
+    // it must also reach a worker the operator starts by hand, and it must not
+    // be dropped by the launchd plist's fixed argument list.
+    env.insert(
+        crate::config::MEMORY_MB_ENV.to_string(),
+        config.memory_mb.to_string(),
+    );
     // Other variables (including PATH and offline flags) are already inherited.
     // Re-setting PATH makes std::process fall back from posix_spawn to fork for
     // bare executable names; macOS frameworks are not safe after threaded fork.
@@ -1224,6 +1231,8 @@ mod tests {
         assert_eq!(env.get("HF_HUB_OFFLINE").map(String::as_str), Some("1"));
         assert_eq!(env.get("LAYAD_DEVICE").map(String::as_str), Some("mps"));
         assert_eq!(env.get("PYTHONUNBUFFERED").map(String::as_str), Some("1"));
+        // The memory ceiling reaches the worker even under launchd.
+        assert_eq!(env.get(crate::config::MEMORY_MB_ENV).map(String::as_str), Some("2048"));
     }
 
     #[tokio::test]
