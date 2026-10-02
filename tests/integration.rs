@@ -829,11 +829,29 @@ impl Daemon {
     /// `layad listening on http://HOST:PORT` line; the port is read from that
     /// line, never guessed.
     async fn start(dir: &tempfile::TempDir, worker_args: &[&str], extra: &[&str]) -> Daemon {
+        Self::start_with_env(dir, worker_args, extra, &[]).await
+    }
+
+    /// Like `start`, but sets (or removes) `envs` in the daemon's own process
+    /// environment first. `None` removes the variable, so the "unset" case
+    /// cannot be masked by whatever the test runner exported.
+    async fn start_with_env(
+        dir: &tempfile::TempDir,
+        worker_args: &[&str],
+        extra: &[&str],
+        envs: &[(&str, Option<&str>)],
+    ) -> Daemon {
         let script = fake_script();
         let pid_file = dir.path().join("daemon-worker.pid");
         let log = dir.path().join("daemon.log");
         let log_file = std::fs::File::create(&log).expect("daemon log");
         let mut command = Command::new(env!("CARGO_BIN_EXE_layad"));
+        for (key, value) in envs {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
         command
             .arg("--bind")
             .arg("127.0.0.1:0")
@@ -1232,6 +1250,52 @@ async fn checkpoint_selection_reaches_the_worker() {
     let info = worker.info().await.expect("worker metadata");
     assert_eq!(info.checkpoint, "english");
     worker.shutdown(Duration::from_secs(5)).await;
+}
+
+/// An unset, empty or garbage `LAYAD_MEMORY_MB` must fall back to the
+/// documented 2048 MiB default instead of aborting startup: clap's `env` would
+/// parse the exported-empty string itself and refuse to start ("cannot parse
+/// integer from empty string"), which is how a launchd job or shell that
+/// exports the variable with no value ends up with a dead service. The value
+/// the daemon settles on must also be the one the worker actually receives.
+#[tokio::test]
+async fn memory_budget_env_variants_fall_back_to_the_default() {
+    for raw in [None, Some(""), Some("   "), Some("not-a-number")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_file = dir.path().join("memory.env");
+        let env_file_str = env_file.to_str().expect("utf-8 path");
+        let _daemon = Daemon::start_with_env(
+            &dir,
+            &["--mode", "normal", "--env-file", env_file_str],
+            &[],
+            &[(layad::config::MEMORY_MB_ENV, raw)],
+        )
+        .await;
+        let env = read_env_file(&env_file).await;
+        assert_eq!(
+            env.get("LAYAD_MEMORY_MB").map(String::as_str),
+            Some("2048"),
+            "LAYAD_MEMORY_MB={raw:?} must fall back to the default: {env:?}"
+        );
+    }
+
+    // An explicit flag still beats the environment, even an empty one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env_file = dir.path().join("flag.env");
+    let env_file_str = env_file.to_str().expect("utf-8 path");
+    let _daemon = Daemon::start_with_env(
+        &dir,
+        &["--mode", "normal", "--env-file", env_file_str],
+        &["--memory-mb", "3072"],
+        &[(layad::config::MEMORY_MB_ENV, Some(""))],
+    )
+    .await;
+    let env = read_env_file(&env_file).await;
+    assert_eq!(
+        env.get("LAYAD_MEMORY_MB").map(String::as_str),
+        Some("3072"),
+        "--memory-mb must win over an empty environment: {env:?}"
+    );
 }
 
 /// A worker that answers `ready:false` — how the real worker reports a missing

@@ -116,6 +116,32 @@ impl std::fmt::Display for Backend {
     }
 }
 
+/// Default ceiling for the resident worker's memory, in MiB. The worker caps
+/// its Metal buffer cache and wired pool to stay inside it (see README
+/// "Memory"); `0` leaves the inference stack's own limits alone.
+pub const DEFAULT_MEMORY_MB: usize = 2048;
+
+/// Environment variable the daemon passes to the worker for the budget.
+pub const MEMORY_MB_ENV: &str = "LAYAD_MEMORY_MB";
+
+/// Smallest budget that still fits the resident checkpoint and the stack.
+const MIN_MEMORY_MB: usize = 512;
+
+/// Default for `--memory-mb`, honouring the environment fallback.
+///
+/// This is the `default_value_t` of `--memory-mb`, so clap evaluates it for
+/// every run. It cannot be paired with clap's `env` on the same argument, or
+/// clap would parse the variable itself, and `LAYAD_MEMORY_MB=` (an empty
+/// export, as launchd jobs and shells routinely produce) would abort startup
+/// with "cannot parse integer from empty string". An unset, empty or
+/// non-numeric value means the default here instead.
+fn default_memory_mb() -> usize {
+    std::env::var(MEMORY_MB_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MEMORY_MB)
+}
+
 fn default_python() -> PathBuf {
     let local = PathBuf::from(".venv/bin/python");
     if local.is_file() {
@@ -191,6 +217,23 @@ pub struct Cli {
     #[arg(long, value_enum, env = "LAYAD_DEVICE", default_value_t = Device::Auto)]
     pub device: Device,
 
+    /// Memory ceiling for the resident worker, in MiB.
+    ///
+    /// The worker holds a checkpoint and a Metal buffer cache for the life of
+    /// the daemon, and the stack caps neither by itself; this budget bounds
+    /// both so a busy classifier cannot grow the process to tens of gigabytes.
+    /// `0` disables layad's cap and leaves the stack's own limits alone.
+    ///
+    /// The `LAYAD_MEMORY_MB` fallback is read inside `default_memory_mb()`
+    /// rather than through clap's `env`, so an unset, empty or non-numeric
+    /// export means the default instead of a startup failure.
+    #[arg(
+        long,
+        default_value_t = default_memory_mb(),
+        value_name = "MIB"
+    )]
+    pub memory_mb: usize,
+
     /// Environment variable for the worker, `KEY=VALUE` (repeatable).
     #[arg(
         long = "python-env",
@@ -257,6 +300,7 @@ pub struct Config {
     pub checkpoint: Checkpoint,
     pub backend: Backend,
     pub device: Device,
+    pub memory_mb: usize,
     pub python_env: Vec<(String, String)>,
     pub max_body_bytes: usize,
     pub max_questions: usize,
@@ -289,6 +333,17 @@ impl Config {
         }
         if self.max_response_bytes == 0 {
             return Err("--max-response-bytes must be greater than zero".to_string());
+        }
+        // The budget is a ceiling, so an absurdly small one is a mistake: a
+        // resident checkpoint alone does not fit in a few hundred MiB and the
+        // worker would refuse to start. (0 is the documented "disabled".)
+        if self.memory_mb != 0 && self.memory_mb < MIN_MEMORY_MB {
+            return Err(format!(
+                "--memory-mb {value} is below the {min} MiB a resident checkpoint needs; \
+                 raise it or pass 0 to disable layad's memory cap",
+                value = self.memory_mb,
+                min = MIN_MEMORY_MB
+            ));
         }
         for (name, value) in &self.python_env {
             if name.is_empty() || name.contains('=') {
@@ -380,6 +435,7 @@ impl TryFrom<Cli> for Config {
             checkpoint: cli.checkpoint,
             backend: cli.backend,
             device: cli.device,
+            memory_mb: cli.memory_mb,
             python_env,
             max_body_bytes: cli.max_body_bytes,
             max_questions: cli.max_questions,
@@ -415,6 +471,8 @@ mod tests {
         // Apple MLX is the default backend and picks the GPU itself.
         assert_eq!(config.backend, Backend::Mlx);
         assert_eq!(config.device, Device::Auto);
+        // A resident checkpoint plus its cache fits in a couple of gigabytes.
+        assert_eq!(config.memory_mb, DEFAULT_MEMORY_MB);
         assert_eq!(DEFAULT_MODEL, "aac6fef/laya-mlx");
         assert!(config.fail_fast);
         let (_, args) = config.worker_command();
@@ -509,6 +567,31 @@ mod tests {
         ] {
             Config::try_from(cli(&args)).expect("valid backend/device pairing");
         }
+    }
+
+    #[test]
+    fn memory_budget_is_configurable_and_validated() {
+        let config = Config::try_from(cli(&["--memory-mb", "3072"])).unwrap();
+        assert_eq!(config.memory_mb, 3072);
+        // 0 is the documented "no cap".
+        let config = Config::try_from(cli(&["--memory-mb", "0"])).unwrap();
+        assert_eq!(config.memory_mb, 0);
+        // A budget no resident checkpoint could fit in is refused.
+        let err = Config::try_from(cli(&["--memory-mb", "64"])).unwrap_err();
+        assert!(err.contains("--memory-mb"), "{err}");
+        assert!(err.contains("0"), "{err}");
+    }
+
+    #[test]
+    fn memory_default_ignores_an_empty_or_garbage_environment() {
+        // `default_memory_mb` is what `--memory-mb` uses, so an exported but
+        // empty (or non-numeric) `LAYAD_MEMORY_MB` must mean "the default", not
+        // "abort startup". The end-to-end version of this lives in
+        // `tests/integration.rs`, which spawns the real binary.
+        assert_eq!(default_memory_mb(), DEFAULT_MEMORY_MB);
+        // The default is a plain 2048 MiB ceiling the flag can override.
+        assert_eq!(DEFAULT_MEMORY_MB, 2048);
+        assert!(MIN_MEMORY_MB < DEFAULT_MEMORY_MB);
     }
 
     #[test]

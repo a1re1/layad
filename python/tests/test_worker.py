@@ -9,9 +9,11 @@ stacks, and the stdout isolation that keeps protocol frames clean.
 
 import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -386,6 +388,148 @@ class DeviceSelectionTests(unittest.TestCase):
         worker = load_worker_module()
         with self.assertRaises(SystemExit):
             worker.parse_args(["--backend", "metal"])
+
+
+MIB = 1024 * 1024
+
+
+class MemoryBudgetTests(unittest.TestCase):
+    """The cap that keeps the resident worker inside a few GB, MLX stubbed out."""
+
+    @staticmethod
+    def stub_mlx(active_bytes):
+        """A stand-in for ``mlx.core`` that records every limit it is given."""
+        calls = {"cache_limits": [], "wired_limits": [], "cleared": 0}
+
+        class StubCore:
+            __version__ = "stub"
+
+            @staticmethod
+            def get_active_memory():
+                return active_bytes
+
+            @staticmethod
+            def set_cache_limit(value):
+                calls["cache_limits"].append(value)
+
+            @staticmethod
+            def set_wired_limit(value):
+                calls["wired_limits"].append(value)
+
+            @staticmethod
+            def clear_cache():
+                calls["cleared"] += 1
+
+        # ``import mlx.core as mx`` binds ``mx`` to the *attribute* ``core`` of
+        # the top-level module, so the stub has to hang off the package, not
+        # only sit in ``sys.modules``.
+        package = mock.MagicMock()
+        package.core = StubCore
+        modules = {"mlx": package, "mlx.core": StubCore}
+        return modules, calls
+
+    def test_budget_caps_cache_from_the_measured_usage(self):
+        worker = load_worker_module()
+        args = worker.parse_args(["--model", "fake/model", "--memory-mb", "2048"])
+        modules, calls = self.stub_mlx(900 * MIB)
+        with mock.patch.dict(sys.modules, modules):
+            worker.apply_memory_budget(args)
+        # 2048 MiB budget - 384 MiB overhead - 900 MiB already held by the model.
+        self.assertEqual(calls["cache_limits"], [764 * MIB])
+        self.assertEqual(calls["wired_limits"], [1664 * MIB])
+        # The buffers the load left behind are handed back before serving starts.
+        self.assertEqual(calls["cleared"], 1)
+
+    def test_a_budget_below_the_floor_is_raised_not_starved(self):
+        worker = load_worker_module()
+        args = worker.parse_args(["--memory-mb", "600"])
+        modules, calls = self.stub_mlx(900 * MIB)
+        with mock.patch.dict(sys.modules, modules):
+            worker.apply_memory_budget(args)
+        # Never a cache of nothing: the floor wins and the wired pool has to fit
+        # the weights plus that floor.
+        self.assertEqual(calls["cache_limits"], [worker.MLX_MIN_CACHE_BYTES])
+        self.assertEqual(calls["wired_limits"], [1028 * MIB])
+
+    def test_zero_disables_the_cap_and_never_touches_the_allocator(self):
+        worker = load_worker_module()
+        args = worker.parse_args(["--memory-mb", "0"])
+        modules, calls = self.stub_mlx(0)
+        with mock.patch.dict(sys.modules, modules):
+            worker.apply_memory_budget(args)
+        self.assertEqual(calls, {"cache_limits": [], "wired_limits": [], "cleared": 0})
+
+    def test_torch_backend_does_not_touch_the_mlx_allocator(self):
+        worker = load_worker_module()
+        args = worker.parse_args(["--backend", "torch", "--model", "fake/model"])
+        modules, calls = self.stub_mlx(0)
+        with mock.patch.dict(sys.modules, modules):
+            worker.apply_memory_budget(args)
+        self.assertEqual(calls, {"cache_limits": [], "wired_limits": [], "cleared": 0})
+
+    def test_default_budget_is_two_gibibytes_and_env_overrides_it(self):
+        worker = load_worker_module()
+        self.assertEqual(worker.parse_args(["--model", "fake/model"]).memory_mb, 2048)
+        self.assertEqual(worker.DEFAULT_MEMORY_BUDGET_MB, 2048)
+        with mock.patch.dict(os.environ, {worker.MEMORY_BUDGET_ENV: "3072"}):
+            args = worker.parse_args(["--model", "fake/model"])
+        self.assertEqual(args.memory_mb, 3072)
+
+    def test_a_malformed_budget_is_refused_instead_of_ignored(self):
+        worker = load_worker_module()
+        with mock.patch.dict(os.environ, {worker.MEMORY_BUDGET_ENV: "plenty"}):
+            with self.assertRaises(SystemExit):
+                worker.parse_args(["--model", "fake/model"])
+
+
+class MemoryBudgetPlumbingTests(unittest.TestCase):
+    """End to end: the budget flag is applied and reported by the real worker."""
+
+    STUB = '''
+class _D:
+    type = "cpu"
+
+
+class _Agent:
+    device = _D()
+
+    def predict(self, state, questions):
+        return {"model": "stub", "answers": {}, "usage": {}}
+
+
+def load(model, device=None, subfolder=None):
+    return _Agent()
+'''
+
+    def run_worker(self, argv, env):
+        with tempfile.TemporaryDirectory() as tmp:
+            pathlib.Path(tmp, "laya_mlx.py").write_text(self.STUB)
+            child_env = dict(os.environ, PYTHONPATH=tmp, **env)
+            completed = subprocess.run(
+                [sys.executable, str(WORKER_PATH), "--model", "stub/model", *argv],
+                input='{"id": null, "method": "shutdown"}\n',
+                capture_output=True,
+                text=True,
+                env=child_env,
+                check=False,
+            )
+        frames = [json.loads(line) for line in completed.stdout.splitlines() if line]
+        self.assertTrue(frames, completed.stderr)
+        return frames[0], completed
+
+    def test_the_worker_reports_the_budget_it_applied(self):
+        frame, completed = self.run_worker([], {"LAYAD_MEMORY_MB": "3072"})
+        self.assertTrue(frame.get("ready"), frame)
+        self.assertEqual(frame["memory_budget_mb"], 3072)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_the_cap_is_on_by_default(self):
+        frame, _ = self.run_worker([], {"LAYAD_MEMORY_MB": ""})
+        self.assertEqual(frame["memory_budget_mb"], 2048)
+
+    def test_the_flag_wins_over_the_environment(self):
+        frame, _ = self.run_worker(["--memory-mb", "4096"], {"LAYAD_MEMORY_MB": ""})
+        self.assertEqual(frame["memory_budget_mb"], 4096)
 
 
 class DeviceLabelTests(unittest.TestCase):

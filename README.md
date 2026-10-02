@@ -30,6 +30,46 @@ curl                                              resident Python worker
 * Fail-fast: if the worker dies, replies out of order, or misses a deadline, the
 daemon tears the worker down and shuts down so `launchd` can restart it cleanly.
 
+## Memory
+
+The worker holds one checkpoint plus a Metal buffer cache for the life of the
+daemon, and the inference stack caps neither: every differently-shaped batch
+leaves buffers in the cache, and MLX's wired pool lets the process claim a
+steadily larger share of unified memory. A busy classifier therefore used to
+climb to tens of gigabytes (reproduced: a worker driven with classifier-shaped
+batches settled at a 12-13 GB Metal footprint; a live daemon was measured at
+49 GB) while never answering worse because the memory was only ever cached.
+
+layad now bounds the worker to a budget, `--memory-mb` / `LAYAD_MEMORY_MB`,
+default **2048 MiB**. The budget covers the *whole resident process*, so the
+checkpoint and interpreter are measured and subtracted before the buffer cache
+gets the rest; the cache is capped with `mlx.core.set_cache_limit`, buffers left
+over from loading are released with `clear_cache`, and the wired pool is pinned
+with `set_wired_limit`. Eviction means the allocator asks the system for memory
+between batches, which costs some throughput but never correctness.
+
+Measured against the real checkpoint, driven with classifier-shaped batches
+(`/usr/bin/footprint`, which counts the Metal allocations a plain RSS reading
+misses):
+
+| | total footprint |
+| --- | --- |
+| stack defaults, 120 batches | 12-13 GB, still climbing |
+| `LAYAD_MEMORY_MB=2048`, 150 batches | ~1.9 GB, flat |
+
+A larger budget raises the ceiling by roughly the same amount. The cap is a
+ceiling, not a reservation: with the default 2048 MiB the resident worker sits
+at ~1.9 GB under classifier load and stays there, where before it only stopped
+growing when the machine ran out of memory.
+
+Set `LAYAD_MEMORY_MB=0` to leave the stack's own limits alone, or raise it if
+the workload is batch-heavy and slower answers are not acceptable. Budgets
+below 512 MiB are refused (a resident checkpoint does not fit) and a budget
+tighter than the checkpoint plus the minimum cache is raised to fit, with the
+effective value logged on stderr. The PyTorch backend owns its allocator, so the
+budget applies to `--backend mlx` only; `layad` says so at startup rather than
+trying to cap someone else's allocator.
+
 ## Requirements
 
 * macOS on Apple silicon (the default MLX backend is Apple-only; launchd
@@ -71,6 +111,7 @@ Selection is by environment variable:
 | `LAYAD_CHECKPOINT` | `english`, `multilingual`, `typed-decisions` | `english` |
 | `LAYAD_BACKEND` | `mlx`, `torch` | `mlx` |
 | `LAYAD_DEVICE` | `auto`, `cpu`, `gpu`, `mps`, `cuda` | `auto` |
+| `LAYAD_MEMORY_MB` | MiB ceiling for the resident worker, or `0` for no cap | `2048` |
 | `LAYAD_MODEL_REPO` | any HF repo id | `aac6fef/laya-mlx` |
 | `LAYAD_RECOMPILE=1` | recompile `requirements.txt` from `.in` | off |
 | `LAYAD_SKIP_DOWNLOAD=1` | reuse `.layad/model` | off |
